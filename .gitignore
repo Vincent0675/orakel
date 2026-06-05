@@ -18,6 +18,9 @@ wheels/
 # Data directories (MinIO local storage, ML models)
 data/
 
+# External JARs (hadoop-aws, aws-sdk — downloaded at runtime)
+jars/
+
 # IDE
 .vscode/
 .idea/
