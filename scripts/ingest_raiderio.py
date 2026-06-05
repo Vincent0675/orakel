@@ -40,12 +40,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Max pages to fetch (0 = unlimited)",
     )
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        default=20,
-        help="Results per page (default: 20)",
-    )
     return parser.parse_args()
 
 
@@ -92,7 +86,7 @@ def run_to_row(run: dict, season: str) -> dict:
         "source": "raiderio",
         "keystone_run_id": run.get("keystone_run_id", run.get("id")),
         "dungeon_id": run.get("dungeon", {}).get("id"),
-        "challenge_mode_id": run.get("challenge_mode_id"),
+        "challenge_mode_id": run.get("dungeon", {}).get("map_challenge_mode_id"),
         "dungeon_name": run.get("dungeon", {}).get("name"),
         "mythic_level": run.get("mythic_level"),
         "clear_time_ms": run.get("clear_time_ms"),
@@ -123,10 +117,8 @@ def main() -> None:
             logger.info("Reached page limit (%d). Stopping.", args.limit)
             break
 
-        logger.info("Fetching page %d (page_size=%d)...", page, args.page_size)
-        runs = client.fetch_runs(
-            season=args.season, page=page, page_size=args.page_size
-        )
+        logger.info("Fetching page %d...", page)
+        runs = client.fetch_runs(season=args.season, page=page)
 
         if not runs:
             logger.info("Empty page %d — end of data.", page)

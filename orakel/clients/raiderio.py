@@ -44,14 +44,13 @@ class RaiderIOClient:
             self._session.params = {"access_key": api_key}
 
     def fetch_runs(
-        self, season: str, page: int = 1, page_size: int = 20
+        self, season: str, page: int = 1
     ) -> list[dict[str, Any]]:
         """Fetch a single page of Mythic+ runs from Raider.IO.
 
         Args:
             season: Season identifier (e.g. "season-tww-3").
             page: Page number (1-indexed).
-            page_size: Number of results per page (default 20, max varies).
 
         Returns:
             List of run dicts from the API response. Returns an empty list
@@ -65,7 +64,6 @@ class RaiderIOClient:
         params: dict[str, Any] = {
             "season": season,
             "page": page,
-            "page_size": page_size,
         }
 
         for attempt in range(self.max_retries + 1):
@@ -73,7 +71,9 @@ class RaiderIOClient:
 
             if response.status_code == 200:
                 data = response.json()
-                runs = data.get("runs", [])
+                # Raider.IO returns rankings, each containing a 'run' key
+                rankings = data.get("rankings", [])
+                runs = [r.get("run", r) for r in rankings]
                 if not runs:
                     logger.info(
                         "No runs returned for season=%s page=%d — end of data",
