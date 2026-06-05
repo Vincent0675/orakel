@@ -9,5 +9,24 @@ wheels/
 # Virtual environments
 .venv
 
+# Environment variables
+.env
+
+# Python version (managed by uv)
+.python-version
+
+# Data directories (MinIO local storage, ML models)
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# SDD artifacts (keep if tracked, but ignore by default)
+.openspec/
+
 # Docs aparte
 Asignación de Proyecto Integrador.md
