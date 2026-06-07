@@ -81,43 +81,43 @@ Chain strategy: pending
 
 ## Phase 2: Silver + KPI 4 (Composition Synergy)
 
-- [ ] 2.1 Create `orakel/pipeline/bronze.py` — refactor ingest logic into pipeline module
+- [x] 2.1 Create `orakel/pipeline/bronze.py` — refactor ingest logic into pipeline module
   - **Files**: `orakel/pipeline/bronze.py`
   - **Deps**: 1.4, 1.5, 1.6
   - **Effort**: M
   - **Acceptance**: `BronzePipeline.ingest_raiderio()` produces same output as ingest_raiderio.py; callable from other scripts
 
-- [ ] 2.2 Create `orakel/pipeline/silver.py` — clean, dedup, type casting (no WCL join yet)
+- [x] 2.2 Create `orakel/pipeline/silver.py` — clean, dedup, type casting (no WCL join yet)
   - **Files**: `orakel/pipeline/silver.py`
   - **Deps**: 2.1
   - **Effort**: M
   - **Acceptance**: `SilverPipeline.clean_raiderio()` reads Bronze, dedupes by `keystone_run_id`, enforces types, writes `silver/raiderio_runs/`
 
-- [ ] 2.3 Create `scripts/bronze_to_silver.py` — Spark job: Bronze → Silver
+- [x] 2.3 Create `scripts/bronze_to_silver.py` — Spark job: Bronze → Silver
   - **Files**: `scripts/bronze_to_silver.py`
   - **Deps**: 2.2, 1.4
   - **Effort**: S
   - **Acceptance**: `uv run python scripts/bronze_to_silver.py --season season-tww-3` produces Silver Parquet; dedup verified by row count reduction
 
-- [ ] 2.4 Create `orakel/models/kpi.py` — pure Python KPI functions (all 4)
+- [x] 2.4 Create `orakel/models/kpi.py` — pure Python KPI functions (all 4)
   - **Files**: `orakel/models/kpi.py`
   - **Deps**: None
   - **Effort**: M
   - **Acceptance**: All 4 functions work: `compute_death_clock(dtps, hps, max_hp)`, `compute_healer_deficit(tank_dtps, healer_hps)`, `compute_interrupt_rate(successful, total)`, `compute_synergy_score(comp_avg, overall_avg)`; edge cases return correct sentinel/NULL values
 
-- [ ] 2.5 Create `orakel/pipeline/gold.py` — KPI aggregations + dimension tables
+- [x] 2.5 Create `orakel/pipeline/gold.py` — KPI aggregations + dimension tables
   - **Files**: `orakel/pipeline/gold.py`
   - **Deps**: 2.3, 2.4
   - **Effort**: L
   - **Acceptance**: `GoldPipeline.compute_synergy()` writes `gold/kpi_composition_synergy/`; `GoldPipeline.compute_kpi4_from_raiderio()` groups by (dungeon, key_level, affixes, comp) and computes ratio; NULL for sample_count=1
 
-- [ ] 2.6 Create `scripts/silver_to_gold.py` — Spark job: Silver → Gold
+- [x] 2.6 Create `scripts/silver_to_gold.py` — Spark job: Silver → Gold
   - **Files**: `scripts/silver_to_gold.py`
   - **Deps**: 2.5, 1.4
   - **Effort**: S
   - **Acceptance**: `uv run python scripts/silver_to_gold.py --season season-tww-3` produces Gold Parquet files under `gold/`
 
-- [ ] 2.7 Verify KPI 4 (Composition Synergy) computed from Raider.IO-only data
+- [x] 2.7 Verify KPI 4 (Composition Synergy) computed from Raider.IO-only data
   - **Files**: None (verification only)
   - **Deps**: 2.6
   - **Effort**: S
