@@ -13,6 +13,24 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+# ─── Nested Structs for Raider.IO roster ─────────────────────────────────────
+
+realm_struct = StructType([
+    StructField("id", IntegerType(), nullable=True),
+    StructField("connectedRealmId", IntegerType(), nullable=True),
+    StructField("wowRealmId", IntegerType(), nullable=True),
+    StructField("wowConnectedRealmId", IntegerType(), nullable=True),
+    StructField("name", StringType(), nullable=True),
+    StructField("slug", StringType(), nullable=True),
+    StructField("locale", StringType(), nullable=True),
+])
+
+region_struct = StructType([
+    StructField("name", StringType(), nullable=True),
+    StructField("slug", StringType(), nullable=True),
+    StructField("short_name", StringType(), nullable=True),
+])
+
 # ─── Bronze Layer ─────────────────────────────────────────────────────────────
 
 bronze_raiderio_schema = StructType(
@@ -38,8 +56,8 @@ bronze_raiderio_schema = StructType(
                         StructField("class", StringType(), nullable=True),
                         StructField("spec", StringType(), nullable=True),
                         StructField("role", StringType(), nullable=True),
-                        StructField("realm", StringType(), nullable=True),
-                        StructField("region", StringType(), nullable=True),
+                        StructField("realm", realm_struct, nullable=True),
+                        StructField("region", region_struct, nullable=True),
                     ]
                 )
             ),
