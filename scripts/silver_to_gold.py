@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Silver → Gold pipeline job.
 
-Reads Silver Raider.IO data, computes KPI 4 (Composition Synergy Score),
-and builds dimension tables (dungeon, player, affix, spec).
+Reads Silver data, computes all 4 KPIs, and builds dimension tables.
+KPIs 1-3 use WCL combat data (fallback to Raider.IO-only if unavailable).
+KPI 4 uses Raider.IO-only data.
 
 Usage:
     uv run python scripts/silver_to_gold.py --season season-tww-3
@@ -35,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default=settings.SEASON,
         help=f"Season identifier (default: {settings.SEASON})",
     )
+    parser.add_argument(
+        "--skip-wcl-kpis",
+        action="store_true",
+        help="Skip KPIs 1-3 that require WCL data (compute Raiders.IO-only fallbacks)",
+    )
     return parser.parse_args()
 
 
@@ -48,12 +54,40 @@ def main() -> None:
     results: dict[str, int] = {}
 
     try:
-        # KPI 4: Composition Synergy Score
+        # ── KPI 1: Tank Death Clock ──────────────────────────────────────
+        logger.info("Computing KPI 1 — Tank Death Clock...")
+        try:
+            kpi1_df = GoldPipeline.compute_kpi_death_clock(spark, season=args.season)
+            results["kpi_tank_death_clock"] = kpi1_df.count()
+            logger.info("  KPI 1 rows: %d", results["kpi_tank_death_clock"])
+        except Exception as e:
+            logger.warning("KPI 1 computation failed: %s", e)
+
+        # ── KPI 2: Healer Deficit ─────────────────────────────────────────
+        logger.info("Computing KPI 2 — Healer Deficit...")
+        try:
+            kpi2_df = GoldPipeline.compute_kpi_healer_deficit(spark, season=args.season)
+            results["kpi_healer_deficit"] = kpi2_df.count()
+            logger.info("  KPI 2 rows: %d", results["kpi_healer_deficit"])
+        except Exception as e:
+            logger.warning("KPI 2 computation failed: %s", e)
+
+        # ── KPI 3: Interrupt Success Rate ──────────────────────────────────
+        logger.info("Computing KPI 3 — Interrupt Success Rate...")
+        try:
+            kpi3_df = GoldPipeline.compute_kpi_interrupt_rate(spark, season=args.season)
+            results["kpi_interrupt_success"] = kpi3_df.count()
+            logger.info("  KPI 3 rows: %d", results["kpi_interrupt_success"])
+        except Exception as e:
+            logger.warning("KPI 3 computation failed: %s", e)
+
+        # ── KPI 4: Composition Synergy Score ──────────────────────────────
         logger.info("Computing KPI 4 — Composition Synergy Score...")
         kpi4_df = GoldPipeline.compute_kpi_synergy(spark, season=args.season)
         results["kpi_composition_synergy"] = kpi4_df.count()
+        logger.info("  KPI 4 rows: %d", results["kpi_composition_synergy"])
 
-        # Dimension tables
+        # ── Dimension tables ──────────────────────────────────────────────
         logger.info("Building dim_dungeon...")
         dim_dungeon = GoldPipeline.build_dim_dungeon(spark, season=args.season)
         results["dim_dungeon"] = dim_dungeon.count()
@@ -70,7 +104,7 @@ def main() -> None:
         dim_spec = GoldPipeline.build_dim_spec(spark)
         results["dim_spec"] = dim_spec.count()
 
-        # Summary
+        # ── Summary ───────────────────────────────────────────────────────
         logger.info("=" * 60)
         logger.info("Gold pipeline complete — Summary:")
         for table, count in results.items():
@@ -99,6 +133,13 @@ def main() -> None:
             (F.col("sample_count") >= 2) & F.col("synergy_score").isNotNull()
         ).count()
         logger.info("✓ %d comp groups with valid synergy scores", valid_scores)
+
+        # Verify KPI 1-3 existence
+        for kpi_name in ["kpi_tank_death_clock", "kpi_healer_deficit", "kpi_interrupt_success"]:
+            if kpi_name in results:
+                logger.info("✓ %s exists with %d rows", kpi_name, results[kpi_name])
+            else:
+                logger.warning("✗ %s NOT computed (missing WCL data?)", kpi_name)
 
     except Exception:
         logger.exception("Gold pipeline failed")
