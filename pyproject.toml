@@ -12,6 +12,18 @@ dependencies = [
     "scikit-learn>=1.9.0",
 ]
 
+[dependency-groups]
+test = ["pytest>=8", "pytest-cov>=6", "responses>=0.25", "chispa>=0.12"]
+
+[tool.pytest.ini_options]
+markers = ["spark: tests requiring an active SparkSession"]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+
+[tool.coverage.run]
+source = ["orakel"]
+branch = true
+
 [tool.setuptools.packages.find]
 include = ["orakel*"]
 exclude = ["jars*", "data*", "scripts*"]
