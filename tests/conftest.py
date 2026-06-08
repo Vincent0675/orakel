@@ -1,6 +1,7 @@
-"""Shared test fixtures for Orakel — Tier 1 only (no SparkSession).
+"""Shared test fixtures for Orakel.
 
-Tier 2 fixtures (spark_session) will be added in WU #2.
+Tier 1 fixtures: pure pytest (no Spark).
+Tier 2 fixtures: SparkSession for pipeline integration tests.
 """
 
 from __future__ import annotations
@@ -45,3 +46,29 @@ def mock_wcl_session():
     import responses
 
     return responses
+
+
+# ─── Tier 2: Spark fixtures ────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def spark_session():
+    """Session-scoped SparkSession for Tier 2 tests (local mode, minimal config).
+
+    Created once per test session and reused across all @pytest.mark.spark
+    tests. Automatically stopped when the session ends.
+    """
+    from pyspark.sql import SparkSession
+
+    spark = (
+        SparkSession.builder.master("local[1]")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.driver.memory", "2g")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.driver.extraJavaOptions", "-Duser.timezone=UTC")
+        .config("spark.executor.extraJavaOptions", "-Duser.timezone=UTC")
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
