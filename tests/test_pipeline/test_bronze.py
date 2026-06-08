@@ -1,16 +1,19 @@
-"""Tests for orakel.pipeline.bronze._run_to_row — dict transform (Tier 1).
+"""Tests for orakel.pipeline.bronze — dict transform (Tier 1) and Spark ingest (Tier 2).
 
-Only tests the _run_to_row pure function. The Spark-based ingest_raiderio_runs
-will be tested in Tier 2 (WU #2).
+Tier 1: _run_to_row pure function tests (no Spark).
+Tier 2: ingest_raiderio_runs Spark integration tests (requires SparkSession).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
+from pyspark.sql import DataFrameReader, DataFrameWriter
 
-from orakel.pipeline.bronze import _run_to_row
+from orakel.models.schemas import bronze_raiderio_schema
+from orakel.pipeline.bronze import _run_to_row, ingest_raiderio_runs
 
 
 def _make_run(**overrides):
@@ -124,7 +127,7 @@ class TestRunToRowNullCharacter:
                     "character": {},
                     "role": "dps",
                 },
-            ]
+            ],
         )
         result = _run_to_row(run, "season-tww-3")
         player = result["roster"][0]
@@ -159,3 +162,98 @@ class TestRunToRowWeeklyModifiers:
         del run["weekly_modifiers"]
         result = _run_to_row(run, "season-tww-3")
         assert result["weekly_modifiers"] == []
+
+
+# ─── Tier 2: Spark integration tests ────────────────────────────────────────
+
+
+def _make_spark_row(**overrides):
+    """Factory for a run dict suitable for Spark DataFrame creation.
+
+    Returns a dict matching bronze_raiderio_schema field types.
+    Default values satisfy all non-nullable fields.
+    """
+    base = {
+        "source": "raiderio",
+        "keystone_run_id": 100001,
+        "dungeon_id": 390,
+        "challenge_mode_id": 401,
+        "dungeon_name": "The Rookery",
+        "mythic_level": 10,
+        "clear_time_ms": 1800000,
+        "keystone_time_ms": 2100000,
+        "completed_at": datetime(2025, 1, 15, 20, 30, tzinfo=timezone.utc),
+        "weekly_modifiers": [9, 10],
+        "roster": [
+            {
+                "name": "Thrall",
+                "class": "Warrior",
+                "spec": "Arms",
+                "role": "tank",
+                "realm": {"id": 1, "connectedRealmId": 11, "wowRealmId": 111, "wowConnectedRealmId": 1111, "name": "Azjol-Nerub", "slug": "azjol-nerub", "locale": "enUS"},
+                "region": {"name": "US", "slug": "us", "short_name": "us"},
+            }
+        ],
+        "score": 150.5,
+        "rank": 1,
+        "season": "season-tww-3",
+        "ingested_at": datetime(2025, 1, 15, 21, 0, tzinfo=timezone.utc),
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.spark
+class TestIngestRaiderioRuns:
+    """Tier 2 — Spark tests for ingest_raiderio_runs."""
+
+    def test_ingest_returns_row_count(self, spark_session):
+        """ingest_raiderio_runs returns the total number of rows written."""
+        run_dicts = [_make_run(), _make_run(keystone_run_id=100002)]
+        mock_client = MagicMock()
+        mock_client.fetch_runs.side_effect = [run_dicts, []]
+
+        with patch("orakel.pipeline.bronze.settings") as mock_settings, \
+             patch.object(DataFrameWriter, "parquet"):
+            mock_settings.MINIO_BUCKET = "test-bucket"
+            result = ingest_raiderio_runs(mock_client, spark_session, "season-tww-3", limit=1)
+
+        assert result == 2
+
+    def test_ingest_empty_api_returns_zero(self, spark_session):
+        """Empty API response returns 0 — no DataFrame created."""
+        mock_client = MagicMock()
+        mock_client.fetch_runs.return_value = []
+
+        result = ingest_raiderio_runs(mock_client, spark_session, "season-tww-3")
+
+        assert result == 0
+
+    def test_ingest_dataframe_matches_schema(self, spark_session):
+        """DataFrame created from ingest rows matches bronze_raiderio_schema."""
+        rows = [_run_to_row(_make_run(), "season-tww-3")]
+        df = spark_session.createDataFrame(rows, schema=bronze_raiderio_schema)
+
+        # Verify schema fields are present and types match
+        expected_fields = {f.name for f in bronze_raiderio_schema.fields}
+        actual_fields = {f.name for f in df.schema.fields}
+        assert expected_fields == actual_fields
+
+        # Verify each row has source='raiderio' and correct season
+        assert df.count() == 1
+        row = df.collect()[0]
+        assert row["source"] == "raiderio"
+        assert row["season"] == "season-tww-3"
+
+    def test_ingest_multiple_runs_schema(self, spark_session):
+        """Multiple runs produce correct row count and schema."""
+        rows = [
+            _run_to_row(_make_run(keystone_run_id=100001), "season-tww-3"),
+            _run_to_row(_make_run(keystone_run_id=100002), "season-tww-3"),
+            _run_to_row(_make_run(keystone_run_id=100003), "season-tww-3"),
+        ]
+        df = spark_session.createDataFrame(rows, schema=bronze_raiderio_schema)
+
+        assert df.count() == 3
+        sources = [row["source"] for row in df.collect()]
+        assert all(s == "raiderio" for s in sources)
