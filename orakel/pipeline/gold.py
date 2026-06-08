@@ -1,7 +1,10 @@
 """Gold pipeline — KPI aggregations and dimension tables.
 
-Computes KPI 4 (Composition Synergy Score) from Raider.IO-only Silver data,
-and builds dimension tables for dungeons, players, affixes, and specs.
+Computes all 4 KPIs and builds dimension tables:
+  - KPI 1: Tank Death Clock (DTPS, HPS, EHP → seconds until death)
+  - KPI 2: Healer Deficit (tank DTPS / healer HPS ratio)
+  - KPI 3: Interrupt Success Rate (successful / total casts)
+  - KPI 4: Composition Synergy Score (comp avg / overall avg)
 """
 
 from __future__ import annotations
@@ -21,12 +24,16 @@ from pyspark.sql.types import (
 )
 
 from orakel.config import settings
+from orakel.models.kpi import compute_death_clock, compute_healer_deficit, compute_interrupt_rate
 from orakel.models.schemas import (
     dim_affix_schema,
     dim_dungeon_schema,
     dim_player_schema,
     dim_spec_schema,
     gold_kpi_composition_synergy_schema,
+    gold_kpi_healer_deficit_schema,
+    gold_kpi_interrupt_rate_schema,
+    gold_kpi_tank_death_clock_schema,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,11 +202,13 @@ class GoldPipeline:
         )
 
         # ── Group by (dungeon, key_level, affix_ids, comp_signature) ──────
+        # NOTE: sort affix array so [10, 9, 147] and [9, 10, 147] don't
+        # create separate groups for the same affix set.
         group_cols = [
             F.col("dungeon_id"),
             F.col("dungeon_name"),
             F.col("mythic_level").alias("key_level"),
-            F.col("weekly_modifiers").alias("affix_ids"),
+            F.array_sort(F.col("weekly_modifiers")).alias("affix_ids"),
             F.col("comp_signature"),
         ]
 
@@ -212,7 +221,7 @@ class GoldPipeline:
         overall_agg = silver_with_sig.groupBy(
             F.col("dungeon_id"),
             F.col("mythic_level").alias("key_level"),
-            F.col("weekly_modifiers").alias("affix_ids"),
+            F.array_sort(F.col("weekly_modifiers")).alias("affix_ids"),
         ).agg(
             F.avg("clear_time_ms").alias("overall_avg_clear_time_ms"),
         )
@@ -431,3 +440,482 @@ class GoldPipeline:
 
         logger.info("dim_spec written: %d rows to %s", row_count, gold_path)
         return dim
+
+    # ─── KPI 1: Tank Death Clock ───────────────────────────────────────────
+
+    @staticmethod
+    def compute_kpi_death_clock(spark: SparkSession, season: str) -> DataFrame:
+        """Compute KPI 1 — Tank Death Clock per run.
+
+        Death Clock = EHP / (DTPS - HPS_on_tank)
+        Where:
+          - DTPS = total_damage_taken / fight_duration_seconds
+          - HPS_on_tank = total_healing_received / fight_duration_seconds
+          - EHP = max_hp (MVP approximation)
+          - If DTPS <= HPS_on_tank → infinite survival → sentinel value -1.0, "safe"
+
+        Reads from Silver player_performance for tanks only.
+
+        Args:
+            spark: Active SparkSession.
+            season: Season filter.
+
+        Returns:
+            DataFrame with Tank Death Clock KPI, written to Gold.
+        """
+        # Try to read from silver/player_performance if available
+        pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
+        try:
+            player_perf = spark.read.parquet(pp_path).filter(
+                F.col("season") == season
+            )
+        except Exception:
+            logger.warning(
+                "silver/player_performance not found. "
+                "Computing KPI 1 from Raider.IO-only Silver data."
+            )
+            # Fallback: use silver/raiderio_runs with estimated stats
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+
+        # Filter to tanks only
+        tanks = player_perf.filter(F.col("role") == "tank")
+
+        tank_count = tanks.count()
+        if tank_count == 0:
+            logger.warning("No tank data found in player_performance.")
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+
+        # Compute DTPS and HPS for tanks
+        # DTPS = total_damage_taken / (fight_duration_ms / 1000)
+        # HPS_on_tank = total_healing_received / (fight_duration_ms / 1000)
+        tanks_with_stats = tanks.withColumn(
+            "fight_duration_seconds",
+            F.when(
+                F.col("fight_duration_ms") > 0,
+                F.col("fight_duration_ms") / 1000.0,
+            ).otherwise(F.lit(1.0)),  # Avoid division by zero
+        ).withColumn(
+            "dtps",
+            F.when(
+                F.col("total_damage_taken").isNotNull() & (F.col("fight_duration_seconds") > 0),
+                F.col("total_damage_taken") / F.col("fight_duration_seconds"),
+            ).otherwise(F.lit(0.0)),
+        ).withColumn(
+            "hps_on_tank",
+            F.when(
+                F.col("total_healing_received").isNotNull() & (F.col("fight_duration_seconds") > 0),
+                F.col("total_healing_received") / F.col("fight_duration_seconds"),
+            ).otherwise(F.lit(0.0)),
+        )
+
+        # Join with dungeon_runs for dungeon_id, key_level, affix_ids
+        dr_path = f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs"
+        try:
+            dungeon_runs = spark.read.parquet(dr_path).filter(F.col("season") == season)
+            # Get fight_duration_ms from dungeon_runs clear_time_ms as fallback
+            tanks_joined = tanks_with_stats.join(
+                dungeon_runs.select(
+                    F.col("run_id"),
+                    F.col("dungeon_id"),
+                    F.col("key_level"),
+                    F.col("affix_ids"),
+                    F.col("clear_time_ms").alias("run_clear_time_ms"),
+                ),
+                on="run_id",
+                how="left",
+            )
+        except Exception:
+            # If no dungeon_runs, use player_perf data directly
+            logger.warning("silver/dungeon_runs not found, using raiderio_runs fallback.")
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+
+        # Register KPI UDF
+        death_clock_udf = F.udf(
+            lambda dtps, hps, max_hp: compute_death_clock(dtps, hps, max_hp),
+            returnType=StructType([
+                StructField("death_clock_seconds", DoubleType(), nullable=True),
+                StructField("death_clock_category", StringType(), nullable=True),
+            ]),
+        )
+
+        # Compute Death Clock
+        result = tanks_joined.withColumn(
+            "dc_result",
+            death_clock_udf(
+                F.col("dtps"),
+                F.col("hps_on_tank"),
+                F.coalesce(F.col("max_hp"), F.lit(600000)),  # Default EHP for MVP
+            ),
+        ).withColumn(
+            "death_clock_seconds", F.col("dc_result.death_clock_seconds"),
+        ).withColumn(
+            "death_clock_category", F.col("dc_result.death_clock_category"),
+        ).withColumn(
+            "ehp_estimate", F.coalesce(F.col("max_hp"), F.lit(600000)),
+        ).select(
+            F.col("run_id"),
+            F.coalesce(F.col("dungeon_id"), F.lit(0)).alias("dungeon_id"),
+            F.coalesce(F.col("key_level"), F.lit(0)).alias("key_level"),
+            F.col("player_name").alias("tank_name"),
+            F.col("class_name").alias("tank_class"),
+            F.col("spec_name").alias("tank_spec"),
+            F.col("dtps"),
+            F.col("hps_on_tank"),
+            F.col("ehp_estimate"),
+            F.col("death_clock_seconds"),
+            F.col("death_clock_category"),
+            F.coalesce(F.col("fight_duration_ms"), F.col("run_clear_time_ms")).alias("fight_duration_ms"),
+            F.col("affix_ids"),
+        )
+
+        # Write to Gold
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info("KPI 1 (Tank Death Clock): %d rows written to %s", row_count, gold_path)
+
+        return result
+
+    @staticmethod
+    def _compute_death_clock_from_raiderio(
+        spark: SparkSession, rio_df: DataFrame, season: str
+    ) -> DataFrame:
+        """Compute a placeholder Death Clock using Raider.IO data only.
+
+        Creates estimated entries from tank stats in roster data,
+        with NULL combat metrics (no WCL data available yet).
+
+        Args:
+            spark: Active SparkSession.
+            rio_df: Silver Raider.IO DataFrame.
+            season: Season filter.
+
+        Returns:
+            DataFrame with placeholder Death Clock KPI.
+        """
+        # Explode roster, filter tanks
+        tanks = rio_df.select(
+            F.expr("uuid()").alias("run_id"),
+            F.col("dungeon_id"),
+            F.col("mythic_level").alias("key_level"),
+            F.explode(F.col("roster")).alias("player"),
+            F.col("clear_time_ms").alias("fight_duration_ms"),
+            F.array_sort(F.col("weekly_modifiers")).alias("affix_ids"),
+            F.col("season"),
+        ).filter(F.col("player.role") == "tank")
+
+        result = tanks.select(
+            F.col("run_id"),
+            F.col("dungeon_id"),
+            F.col("key_level"),
+            F.col("player.name").alias("tank_name"),
+            F.col("player.class").alias("tank_class"),
+            F.col("player.spec").alias("tank_spec"),
+            F.lit(None).cast("double").alias("dtps"),
+            F.lit(None).cast("double").alias("hps_on_tank"),
+            F.lit(None).cast("long").alias("ehp_estimate"),
+            F.lit(None).cast("double").alias("death_clock_seconds"),
+            F.lit(None).cast("string").alias("death_clock_category"),
+            F.col("fight_duration_ms"),
+            F.col("affix_ids"),
+        )
+
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info(
+            "KPI 1 (Tank Death Clock, raiderio-only): %d rows written to %s",
+            row_count,
+            gold_path,
+        )
+        return result
+
+    # ─── KPI 2: Healer Deficit ─────────────────────────────────────────────
+
+    @staticmethod
+    def compute_kpi_healer_deficit(spark: SparkSession, season: str) -> DataFrame:
+        """Compute KPI 2 — Healer Deficit per run.
+
+        Deficit = Tank_DTPS / Healer_HPS_on_tank
+
+        Categories:
+          - comfortable: ratio < 1.0
+          - moderate: ratio 1.0 – 1.2
+          - critical: ratio > 1.2
+
+        Args:
+            spark: Active SparkSession.
+            season: Season filter.
+
+        Returns:
+            DataFrame with Healer Deficit KPI, written to Gold.
+        """
+        pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
+        try:
+            player_perf = spark.read.parquet(pp_path).filter(
+                F.col("season") == season
+            )
+        except Exception:
+            logger.warning(
+                "silver/player_performance not found. "
+                "Computing KPI 2 from Raider.IO-only data."
+            )
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season)
+
+        # Separate tanks and healers
+        # Bug #1 fix: total_healing_received now represents healing RECEIVED by
+        # each player (aggregated by target_name).  For KPI 2 we need the HPS
+        # that the tank actually received, so we use the TANK's row.
+        tanks = player_perf.filter(F.col("role") == "tank").select(
+            F.col("run_id").alias("tank_run_id"),
+            F.col("player_name").alias("tank_name"),
+            F.col("class_name").alias("tank_class"),
+            F.col("total_damage_taken").alias("tank_damage_taken"),
+            F.col("total_healing_received").alias("tank_healing_received"),
+            F.col("fight_duration_ms").alias("tank_fight_duration"),
+        )
+
+        healers = player_perf.filter(F.col("role") == "healer").select(
+            F.col("run_id").alias("healer_run_id"),
+            F.col("player_name").alias("healer_name"),
+            F.col("class_name").alias("healer_class"),
+            F.col("spec_name").alias("healer_spec"),
+        )
+
+        # Join tanks and healers on run_id
+        if tanks.count() == 0 or healers.count() == 0:
+            logger.warning("No tank or healer data found. Producing empty KPI 2.")
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season)
+
+        joined = tanks.join(
+            healers,
+            on=F.col("tank_run_id") == F.col("healer_run_id"),
+            how="inner",
+        )
+
+        # Compute DTPS and HPS on tank
+        # tank_dtps = damage taken per second by the tank
+        # hps_on_tank = healing per second received BY the tank (from all healers)
+        joined = joined.withColumn(
+            "tank_dtps",
+            F.when(
+                (F.col("tank_fight_duration") > 0) & F.col("tank_damage_taken").isNotNull(),
+                F.col("tank_damage_taken") / (F.col("tank_fight_duration") / 1000.0),
+            ).otherwise(F.lit(0.0)),
+        ).withColumn(
+            "healer_hps_on_tank",
+            F.when(
+                (F.col("tank_fight_duration") > 0) & F.col("tank_healing_received").isNotNull(),
+                F.col("tank_healing_received") / (F.col("tank_fight_duration") / 1000.0),
+            ).otherwise(F.lit(0.0)),
+        )
+
+        # Register KPI UDF
+        healer_deficit_udf = F.udf(
+            lambda tank_dtps, healer_hps: compute_healer_deficit(tank_dtps, healer_hps),
+            returnType=StructType([
+                StructField("deficit_ratio", DoubleType(), nullable=True),
+                StructField("deficit_category", StringType(), nullable=True),
+            ]),
+        )
+
+        # Compute Deficit
+        result = joined.withColumn(
+            "hd_result",
+            healer_deficit_udf(F.col("tank_dtps"), F.col("healer_hps_on_tank")),
+        ).withColumn(
+            "deficit_ratio", F.col("hd_result.deficit_ratio"),
+        ).withColumn(
+            "deficit_category", F.col("hd_result.deficit_category"),
+        ).select(
+            F.col("tank_run_id").alias("run_id"),
+            F.col("healer_name"),
+            F.col("healer_class"),
+            F.col("healer_spec"),
+            F.col("tank_dtps"),
+            F.col("healer_hps_on_tank"),
+            F.col("deficit_ratio"),
+            F.col("deficit_category"),
+        )
+
+        # Join with dungeon_runs for affix_ids
+        dr_path = f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs"
+        try:
+            dungeon_runs = spark.read.parquet(dr_path).filter(F.col("season") == season)
+            result = result.join(
+                dungeon_runs.select(F.col("run_id"), F.col("affix_ids")),
+                on="run_id",
+                how="left",
+            )
+        except Exception:
+            result = result.withColumn("affix_ids", F.lit(None).cast("array<int>"))
+
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info("KPI 2 (Healer Deficit): %d rows written to %s", row_count, gold_path)
+
+        return result
+
+    @staticmethod
+    def _compute_healer_deficit_from_raiderio(
+        spark: SparkSession, rio_df: DataFrame, season: str
+    ) -> DataFrame:
+        """Compute placeholder Healer Deficit from Raider.IO data only."""
+        healers = rio_df.select(
+            F.expr("uuid()").alias("run_id"),
+            F.explode(F.col("roster")).alias("player"),
+            F.array_sort(F.col("weekly_modifiers")).alias("affix_ids"),
+        ).filter(F.col("player.role") == "healer")
+
+        result = healers.select(
+            F.col("run_id"),
+            F.col("player.name").alias("healer_name"),
+            F.col("player.class").alias("healer_class"),
+            F.col("player.spec").alias("healer_spec"),
+            F.lit(None).cast("double").alias("tank_dtps"),
+            F.lit(None).cast("double").alias("healer_hps_on_tank"),
+            F.lit(None).cast("double").alias("deficit_ratio"),
+            F.lit(None).cast("string").alias("deficit_category"),
+            F.col("affix_ids"),
+        )
+
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info(
+            "KPI 2 (Healer Deficit, raiderio-only): %d rows written to %s",
+            row_count,
+            gold_path,
+        )
+        return result
+
+    # ─── KPI 3: Interrupt Success Rate ──────────────────────────────────────
+
+    @staticmethod
+    def compute_kpi_interrupt_rate(spark: SparkSession, season: str) -> DataFrame:
+        """Compute KPI 3 — Interrupt Success Rate per player per run.
+
+        ISR is computed from ``interrupts_count``, which records the number
+        of successful interrupts per player per fight.  WCL only returns
+        successful interrupt events — there is no "failed interrupt" event —
+        so ISR will always be 100% when data is available.  When
+        ``interrupts_count`` is 0 or NULL (player didn't attempt any
+        interrupts), ISR is NULL (not 0, which would imply they failed).
+
+        Args:
+            spark: Active SparkSession.
+            season: Season filter.
+
+        Returns:
+            DataFrame with Interrupt Rate KPI, written to Gold.
+        """
+        pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
+        try:
+            player_perf = spark.read.parquet(pp_path).filter(
+                F.col("season") == season
+            )
+        except Exception:
+            logger.warning(
+                "silver/player_performance not found. "
+                "Computing KPI 3 from Raider.IO-only data."
+            )
+            rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+            rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
+            return GoldPipeline._compute_interrupt_rate_from_raiderio(spark, rio_df, season)
+
+        # Register KPI UDF — since WCL only provides successful interrupts,
+        # ISR = successful / total, where both are the same count.
+        interrupt_rate_udf = F.udf(
+            lambda successful, total: compute_interrupt_rate(successful, total),
+            returnType=DoubleType(),
+        )
+
+        # Compute ISR per player per run
+        result = player_perf.withColumn(
+            "interrupt_success_rate",
+            interrupt_rate_udf(
+                F.coalesce(F.col("interrupts_count"), F.lit(0)),
+                F.coalesce(F.col("interrupts_count"), F.lit(0)),
+            ),
+        ).select(
+            F.col("run_id"),
+            F.col("player_name"),
+            F.col("class_name").alias("player_class"),
+            F.col("spec_name").alias("player_spec"),
+            F.col("role").alias("player_role"),
+            F.coalesce(F.col("interrupts_count"), F.lit(0)).alias("interrupts_count"),
+            F.col("interrupt_success_rate"),
+            F.lit(None).cast("int").alias("dangerous_enemy_casts"),
+            F.lit(None).cast("double").alias("interrupt_coverage"),
+        )
+
+        # Join with dungeon_runs for affix_ids
+        dr_path = f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs"
+        try:
+            # Join just for affix_ids
+            dr = spark.read.parquet(dr_path).filter(F.col("season") == season)
+            result = result.join(
+                dr.select(F.col("run_id"), F.col("affix_ids")).distinct(),
+                on="run_id",
+                how="left",
+            )
+        except Exception:
+            result = result.withColumn(
+                "dangerous_enemy_casts",
+                F.lit(None).cast("int"),
+            ).withColumn(
+                "interrupt_coverage",
+                F.lit(None).cast("double"),
+            )
+
+        # Fill dangerous_enemy_casts and interrupt_coverage with NULLs if no WCL data
+        # These require WCL event-level data which may not be available
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_success"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info("KPI 3 (Interrupt Rate): %d rows written to %s", row_count, gold_path)
+
+        return result
+
+    @staticmethod
+    def _compute_interrupt_rate_from_raiderio(
+        spark: SparkSession, rio_df: DataFrame, season: str
+    ) -> DataFrame:
+        """Compute placeholder Interrupt Rate from Raider.IO data only."""
+        players = rio_df.select(
+            F.expr("uuid()").alias("run_id"),
+            F.explode(F.col("roster")).alias("player"),
+        )
+
+        result = players.select(
+            F.col("run_id"),
+            F.col("player.name").alias("player_name"),
+            F.col("player.class").alias("player_class"),
+            F.col("player.spec").alias("player_spec"),
+            F.col("player.role").alias("player_role"),
+            F.lit(None).cast("int").alias("interrupts_count"),
+            F.lit(None).cast("double").alias("interrupt_success_rate"),
+            F.lit(None).cast("int").alias("dangerous_enemy_casts"),
+            F.lit(None).cast("double").alias("interrupt_coverage"),
+        )
+
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_success"
+        row_count = result.count()
+        result.write.mode("overwrite").parquet(gold_path)
+        logger.info(
+            "KPI 3 (Interrupt Rate, raiderio-only): %d rows written to %s",
+            row_count,
+            gold_path,
+        )
+        return result

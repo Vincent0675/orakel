@@ -73,7 +73,14 @@ class RaiderIOClient:
                 data = response.json()
                 # Raider.IO returns rankings, each containing a 'run' key
                 rankings = data.get("rankings", [])
-                runs = [r.get("run", r) for r in rankings]
+                # Each ranking entry has {rank, score, run{...}}
+                # Merge score/rank into the run dict before returning
+                runs = []
+                for r in rankings:
+                    run_data = r.get("run", r)
+                    run_data["score"] = r.get("score")
+                    run_data["rank"] = r.get("rank")
+                    runs.append(run_data)
                 if not runs:
                     logger.info(
                         "No runs returned for season=%s page=%d — end of data",

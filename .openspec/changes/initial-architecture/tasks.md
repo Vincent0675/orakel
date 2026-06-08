@@ -81,43 +81,43 @@ Chain strategy: pending
 
 ## Phase 2: Silver + KPI 4 (Composition Synergy)
 
-- [ ] 2.1 Create `orakel/pipeline/bronze.py` — refactor ingest logic into pipeline module
+- [x] 2.1 Create `orakel/pipeline/bronze.py` — refactor ingest logic into pipeline module
   - **Files**: `orakel/pipeline/bronze.py`
   - **Deps**: 1.4, 1.5, 1.6
   - **Effort**: M
   - **Acceptance**: `BronzePipeline.ingest_raiderio()` produces same output as ingest_raiderio.py; callable from other scripts
 
-- [ ] 2.2 Create `orakel/pipeline/silver.py` — clean, dedup, type casting (no WCL join yet)
+- [x] 2.2 Create `orakel/pipeline/silver.py` — clean, dedup, type casting (no WCL join yet)
   - **Files**: `orakel/pipeline/silver.py`
   - **Deps**: 2.1
   - **Effort**: M
   - **Acceptance**: `SilverPipeline.clean_raiderio()` reads Bronze, dedupes by `keystone_run_id`, enforces types, writes `silver/raiderio_runs/`
 
-- [ ] 2.3 Create `scripts/bronze_to_silver.py` — Spark job: Bronze → Silver
+- [x] 2.3 Create `scripts/bronze_to_silver.py` — Spark job: Bronze → Silver
   - **Files**: `scripts/bronze_to_silver.py`
   - **Deps**: 2.2, 1.4
   - **Effort**: S
   - **Acceptance**: `uv run python scripts/bronze_to_silver.py --season season-tww-3` produces Silver Parquet; dedup verified by row count reduction
 
-- [ ] 2.4 Create `orakel/models/kpi.py` — pure Python KPI functions (all 4)
+- [x] 2.4 Create `orakel/models/kpi.py` — pure Python KPI functions (all 4)
   - **Files**: `orakel/models/kpi.py`
   - **Deps**: None
   - **Effort**: M
   - **Acceptance**: All 4 functions work: `compute_death_clock(dtps, hps, max_hp)`, `compute_healer_deficit(tank_dtps, healer_hps)`, `compute_interrupt_rate(successful, total)`, `compute_synergy_score(comp_avg, overall_avg)`; edge cases return correct sentinel/NULL values
 
-- [ ] 2.5 Create `orakel/pipeline/gold.py` — KPI aggregations + dimension tables
+- [x] 2.5 Create `orakel/pipeline/gold.py` — KPI aggregations + dimension tables
   - **Files**: `orakel/pipeline/gold.py`
   - **Deps**: 2.3, 2.4
   - **Effort**: L
   - **Acceptance**: `GoldPipeline.compute_synergy()` writes `gold/kpi_composition_synergy/`; `GoldPipeline.compute_kpi4_from_raiderio()` groups by (dungeon, key_level, affixes, comp) and computes ratio; NULL for sample_count=1
 
-- [ ] 2.6 Create `scripts/silver_to_gold.py` — Spark job: Silver → Gold
+- [x] 2.6 Create `scripts/silver_to_gold.py` — Spark job: Silver → Gold
   - **Files**: `scripts/silver_to_gold.py`
   - **Deps**: 2.5, 1.4
   - **Effort**: S
   - **Acceptance**: `uv run python scripts/silver_to_gold.py --season season-tww-3` produces Gold Parquet files under `gold/`
 
-- [ ] 2.7 Verify KPI 4 (Composition Synergy) computed from Raider.IO-only data
+- [x] 2.7 Verify KPI 4 (Composition Synergy) computed from Raider.IO-only data
   - **Files**: None (verification only)
   - **Deps**: 2.6
   - **Effort**: S
@@ -127,19 +127,19 @@ Chain strategy: pending
 
 ## Phase 3: WCL Integration + KPIs 1–3
 
-- [ ] 3.1 Create `orakel/clients/warcraftlogs.py` — GraphQL+OAuth client with point tracking
+- [x] 3.1 Create `orakel/clients/warcraftlogs.py` — GraphQL+OAuth client with point tracking
   - **Files**: `orakel/clients/warcraftlogs.py`
   - **Deps**: 1.3
   - **Effort**: L
   - **Acceptance**: `WarcraftLogsClient.get_token()` returns access token; `WarcraftLogsClient.fetch_fights(report_code)` returns parsed fights; point budget tracked and resumable
 
-- [ ] 3.2 Create `orakel/utils/rate_limiter.py` — token-bucket for WCL
+- [x] 3.2 Create `orakel/utils/rate_limiter.py` — token-bucket for WCL
   - **Files**: `orakel/utils/rate_limiter.py`
   - **Deps**: None
   - **Effort**: S
   - **Acceptance**: `TokenBucketRateLimiter.consume(cost)` sleeps when budget exhausted; `Retry-After` header respected; 3 retries then abort with logged error
 
-- [ ] 3.3 Create `scripts/match_reports.py` — fuzzy join engine with stratified tank sampling
+- [x] 3.3 Create `scripts/match_reports.py` — fuzzy join engine with stratified tank sampling
   - **Files**: `scripts/match_reports.py`
   - **Deps**: 1.6, 3.1, 3.2, 1.4
   - **Effort**: XL
@@ -151,25 +151,25 @@ Chain strategy: pending
   - **Effort**: M
   - **Acceptance**: `silver/matches/` contains ≥1 match; confidence scores distributed (not all 0.2); match_method values include `"full_3_layer"` or `"rio_only"`
 
-- [ ] 3.5 Create `scripts/ingest_warcraftlogs.py` — fetch WCL events for matched runs
+- [x] 3.5 Create `scripts/ingest_warcraftlogs.py` — fetch WCL events for matched runs
   - **Files**: `scripts/ingest_warcraftlogs.py`
   - **Deps**: 3.1, 3.2, 3.4, 1.4, 1.5
   - **Effort**: L
   - **Acceptance**: Reads match manifest; fetches DamageTaken, HealingDone, Interrupts events per fight; writes to `bronze/warcraftlogs/events/` partitioned by `report_code/fight_id`
 
-- [ ] 3.6 Update `orakel/pipeline/silver.py` — add fuzzy join integration using match manifest
+- [x] 3.6 Update `orakel/pipeline/silver.py` — add fuzzy join integration using match manifest
   - **Files**: `orakel/pipeline/silver.py`
   - **Deps**: 2.2, 3.4
   - **Effort**: M
   - **Acceptance**: `SilverPipeline.apply_fuzzy_join()` reads match manifest; joins WCL events to Raider.IO runs; produces `silver/dungeon_runs/` and `silver/player_performance/`
 
-- [ ] 3.7 Update `scripts/bronze_to_silver.py` — add WCL data processing
+- [x] 3.7 Update `scripts/bronze_to_silver.py` — add WCL data processing
   - **Files**: `scripts/bronze_to_silver.py`
   - **Deps**: 3.5, 3.6
   - **Effort**: S
   - **Acceptance**: Script processes both Raider.IO runs AND WCL events; both land in Silver
 
-- [ ] 3.8 Update `orakel/pipeline/gold.py` — compute KPIs 1–3 (Death Clock, Healer Deficit, Interrupt Rate)
+- [x] 3.8 Update `orakel/pipeline/gold.py` — compute KPIs 1–3 (Death Clock, Healer Deficit, Interrupt Rate)
   - **Files**: `orakel/pipeline/gold.py`
   - **Deps**: 2.5, 3.6
   - **Effort**: L

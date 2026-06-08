@@ -94,7 +94,7 @@ def run_to_row(run: dict, season: str) -> dict:
         "completed_at": completed_at,
         "weekly_modifiers": weekly_modifiers,
         "roster": roster,
-        "score": run.get("score"),
+        "score": float(run["score"]) if run.get("score") is not None else None,
         "rank": run.get("rank"),
         "season": season,
         "ingested_at": datetime.now(timezone.utc),
