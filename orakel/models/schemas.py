@@ -235,9 +235,7 @@ gold_kpi_interrupt_rate_schema = StructType(
         StructField("player_spec", StringType(), nullable=True),
         StructField("player_role", StringType(), nullable=True),
         StructField("interrupts_count", IntegerType(), nullable=True),
-        StructField(
-            "interrupt_success_rate", DoubleType(), nullable=True
-        ),
+        StructField("interrupts_per_minute", DoubleType(), nullable=True),
         StructField(
             "dangerous_enemy_casts", IntegerType(), nullable=True
         ),

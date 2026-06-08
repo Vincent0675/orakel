@@ -26,7 +26,7 @@ from pyspark.sql.types import (
 )
 
 from orakel.config import settings
-from orakel.models.kpi import compute_death_clock, compute_healer_deficit, compute_interrupt_rate
+from orakel.models.kpi import compute_death_clock, compute_healer_deficit
 from orakel.models.schemas import (
     dim_affix_schema,
     dim_dungeon_schema,
@@ -815,18 +815,19 @@ class GoldPipeline:
         )
         return result
 
-    # ─── KPI 3: Interrupt Success Rate ──────────────────────────────────────
+    # ─── KPI 3: Interrupt Rate (count + per-minute) ─────────────────────────
 
     @staticmethod
     def compute_kpi_interrupt_rate(spark: SparkSession, season: str) -> DataFrame:
-        """Compute KPI 3 — Interrupt Success Rate per player per run.
+        """Compute KPI 3 — Interrupt Rate per player per run.
 
-        ISR is computed from ``interrupts_count``, which records the number
-        of successful interrupts per player per fight.  WCL only returns
-        successful interrupt events — there is no "failed interrupt" event —
-        so ISR will always be 100% when data is available.  When
-        ``interrupts_count`` is 0 or NULL (player didn't attempt any
-        interrupts), ISR is NULL (not 0, which would imply they failed).
+        Two metrics derived from WCL interrupts:
+        - ``interrupts_count``: absolute number of successful interrupts
+        - ``interrupts_per_minute``: normalized by fight duration
+
+        WCL only returns successful interrupt events — there is no "failed
+        interrupt" event — so a success-rate metric is meaningless.
+        Normalizing by time allows meaningful cross-player comparison.
 
         Args:
             spark: Active SparkSession.
@@ -851,20 +852,15 @@ class GoldPipeline:
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
             return GoldPipeline._compute_interrupt_rate_from_raiderio(spark, rio_df, season)
 
-        # Register KPI UDF — since WCL only provides successful interrupts,
-        # ISR = successful / total, where both are the same count.
-        interrupt_rate_udf = F.udf(
-            lambda successful, total: compute_interrupt_rate(successful, total),
-            returnType=DoubleType(),
-        )
-
-        # Compute ISR per player per run
+        # Compute interrupts_per_minute: normalize by fight duration
         result = player_perf.withColumn(
-            "interrupt_success_rate",
-            interrupt_rate_udf(
-                F.coalesce(F.col("interrupts_count"), F.lit(0)),
-                F.coalesce(F.col("interrupts_count"), F.lit(0)),
-            ),
+            "interrupts_per_minute",
+            F.when(
+                (F.col("fight_duration_ms").isNotNull())
+                & (F.col("fight_duration_ms") > 0)
+                & (F.col("interrupts_count").isNotNull()),
+                F.col("interrupts_count") / (F.col("fight_duration_ms") / 60000.0),
+            ).otherwise(F.lit(None)),
         ).select(
             F.col("run_id"),
             F.col("player_name"),
@@ -872,7 +868,7 @@ class GoldPipeline:
             F.col("spec_name").alias("player_spec"),
             F.col("role").alias("player_role"),
             F.coalesce(F.col("interrupts_count"), F.lit(0)).alias("interrupts_count"),
-            F.col("interrupt_success_rate"),
+            F.col("interrupts_per_minute"),
             F.lit(None).cast("int").alias("dangerous_enemy_casts"),
             F.lit(None).cast("double").alias("interrupt_coverage"),
         )
@@ -904,7 +900,7 @@ class GoldPipeline:
 
         # Fill dangerous_enemy_casts and interrupt_coverage with NULLs if no WCL data
         # These require WCL event-level data which may not be available
-        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_success"
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
         row_count = result.count()
         result.write.mode("overwrite").parquet(gold_path)
         logger.info("KPI 3 (Interrupt Rate): %d rows written to %s", row_count, gold_path)
@@ -915,7 +911,7 @@ class GoldPipeline:
     def _compute_interrupt_rate_from_raiderio(
         spark: SparkSession, rio_df: DataFrame, season: str
     ) -> DataFrame:
-        """Compute placeholder Interrupt Rate from Raider.IO data only."""
+        """Compute placeholder Interrupt metrics from Raider.IO data only (no WCL)."""
         players = rio_df.select(
             F.expr("uuid()").alias("run_id"),
             F.explode(F.col("roster")).alias("player"),
@@ -928,12 +924,12 @@ class GoldPipeline:
             F.col("player.spec").alias("player_spec"),
             F.col("player.role").alias("player_role"),
             F.lit(None).cast("int").alias("interrupts_count"),
-            F.lit(None).cast("double").alias("interrupt_success_rate"),
+            F.lit(None).cast("double").alias("interrupts_per_minute"),
             F.lit(None).cast("int").alias("dangerous_enemy_casts"),
             F.lit(None).cast("double").alias("interrupt_coverage"),
         )
 
-        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_success"
+        gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
         row_count = result.count()
         result.write.mode("overwrite").parquet(gold_path)
         logger.info(

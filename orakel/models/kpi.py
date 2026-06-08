@@ -4,7 +4,7 @@ All functions are pure (no I/O) and can be used directly or as Spark UDFs.
 They follow the specification in the initial-architecture spec:
     - KPI 1: Tank Death Clock
     - KPI 2: Healer Deficit
-    - KPI 3: Interrupt Success Rate
+    - KPI 3: Interrupt Rate (count + per-minute)
     - KPI 4: Composition Synergy Score
 """
 
@@ -96,31 +96,6 @@ def compute_healer_deficit(
         category = "critical"
 
     return (round(ratio, 4), category)
-
-
-# ─── KPI 3: Interrupt Success Rate ────────────────────────────────────────────
-
-def compute_interrupt_rate(successful: int, total: int) -> float | None:
-    """Compute the interrupt success rate.
-
-    Formula: ``ISR = successful / total``
-
-    Edge case: if ``total`` is 0, returns ``None`` (player didn't attempt
-    any interrupts — not 0, which would imply they failed).
-
-    Args:
-        successful: Number of successful interrupts.
-        total: Total number of interrupt casts attempted.
-
-    Returns:
-        Float rate (0.0-1.0) or None if total is 0.
-    """
-    if total <= 0:
-        return None
-
-    rate = successful / total
-    # Clamp to [0, 1] in case of edge-case data
-    return round(min(max(rate, 0.0), 1.0), 4)
 
 
 # ─── KPI 4: Composition Synergy Score ─────────────────────────────────────────
