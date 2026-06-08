@@ -272,9 +272,17 @@ def match_layer2(
     if completed_at is None or fight_end_ms is None or report_start_time_ms is None:
         return False, float("inf")
 
-    # Convert WCL fight time to epoch ms
-    # WCL times are relative to report start
-    wcl_absolute_time_ms = report_start_time_ms + (fight_end_ms or 0)
+    # WCL fight timestamps may be relative (to report start) or absolute.
+    # Heuristic: if the value exceeds 24 hours in ms (86_400_000), it's
+    # almost certainly an absolute epoch timestamp rather than a relative
+    # offset.  Using a relative value as-if absolute would double-offset
+    # and break matching; the heuristic prevents that.
+    if fight_end_ms > 86_400_000:
+        # Absolute timestamp — use directly
+        wcl_absolute_time_ms = fight_end_ms
+    else:
+        # Relative to report start — add offset
+        wcl_absolute_time_ms = report_start_time_ms + fight_end_ms
 
     # Convert rio completed_at to epoch ms
     if isinstance(completed_at, str):
