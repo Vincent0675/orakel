@@ -52,8 +52,17 @@ class TestOAuthToken:
         with pytest.raises(WCLAuthError, match="authentication failed"):
             client.authenticate()
 
-    def test_missing_credentials_raises_wcl_auth_error(self):
-        """Empty client_id/client_secret raises WCLAuthError before HTTP call."""
+    def test_missing_credentials_raises_wcl_auth_error(self, monkeypatch):
+        """Empty client_id/client_secret raises WCLAuthError before HTTP call.
+
+        The constructor falls back to settings when args are falsy,
+        so we patch settings to force empty credentials.
+        """
+        from orakel.config import settings
+
+        monkeypatch.setattr(settings, "WCL_CLIENT_ID", "")
+        monkeypatch.setattr(settings, "WCL_CLIENT_SECRET", "")
+
         client = WarcraftLogsClient(client_id="", client_secret="")
 
         with pytest.raises(WCLAuthError, match="WCL_CLIENT_ID"):
