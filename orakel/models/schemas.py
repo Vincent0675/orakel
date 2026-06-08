@@ -120,7 +120,10 @@ bronze_wcl_events_schema = StructType(
     [
         StructField("timestamp", LongType(), nullable=False),
         StructField("actor_id", IntegerType(), nullable=False),
+        StructField("player_name", StringType(), nullable=True),
         StructField("source_id", IntegerType(), nullable=True),
+        StructField("target_id", IntegerType(), nullable=True),
+        StructField("target_name", StringType(), nullable=True),
         StructField("ability_id", IntegerType(), nullable=True),
         StructField("ability_name", StringType(), nullable=True),
         StructField("damage_amount", LongType(), nullable=True),
@@ -179,8 +182,7 @@ silver_player_performance_schema = StructType(
         StructField("role", StringType(), nullable=True),
         StructField("total_damage_taken", LongType(), nullable=True),
         StructField("total_healing_received", LongType(), nullable=True),
-        StructField("interrupts_cast", IntegerType(), nullable=True),
-        StructField("interrupts_successful", IntegerType(), nullable=True),
+        StructField("interrupts_count", IntegerType(), nullable=True),
         StructField("max_hp", LongType(), nullable=True),
         StructField("fight_duration_ms", LongType(), nullable=True),
         StructField("season", StringType(), nullable=False),
@@ -232,8 +234,7 @@ gold_kpi_interrupt_rate_schema = StructType(
         StructField("player_class", StringType(), nullable=True),
         StructField("player_spec", StringType(), nullable=True),
         StructField("player_role", StringType(), nullable=True),
-        StructField("total_interrupt_casts", IntegerType(), nullable=True),
-        StructField("successful_interrupts", IntegerType(), nullable=True),
+        StructField("interrupts_count", IntegerType(), nullable=True),
         StructField(
             "interrupt_success_rate", DoubleType(), nullable=True
         ),

@@ -671,11 +671,15 @@ class GoldPipeline:
             return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season)
 
         # Separate tanks and healers
+        # Bug #1 fix: total_healing_received now represents healing RECEIVED by
+        # each player (aggregated by target_name).  For KPI 2 we need the HPS
+        # that the tank actually received, so we use the TANK's row.
         tanks = player_perf.filter(F.col("role") == "tank").select(
             F.col("run_id").alias("tank_run_id"),
             F.col("player_name").alias("tank_name"),
             F.col("class_name").alias("tank_class"),
             F.col("total_damage_taken").alias("tank_damage_taken"),
+            F.col("total_healing_received").alias("tank_healing_received"),
             F.col("fight_duration_ms").alias("tank_fight_duration"),
         )
 
@@ -684,8 +688,6 @@ class GoldPipeline:
             F.col("player_name").alias("healer_name"),
             F.col("class_name").alias("healer_class"),
             F.col("spec_name").alias("healer_spec"),
-            F.col("total_healing_received").alias("healer_hps_raw"),
-            F.col("fight_duration_ms").alias("healer_fight_duration"),
         )
 
         # Join tanks and healers on run_id
@@ -701,7 +703,9 @@ class GoldPipeline:
             how="inner",
         )
 
-        # Compute DTPS and HPS
+        # Compute DTPS and HPS on tank
+        # tank_dtps = damage taken per second by the tank
+        # hps_on_tank = healing per second received BY the tank (from all healers)
         joined = joined.withColumn(
             "tank_dtps",
             F.when(
@@ -711,8 +715,8 @@ class GoldPipeline:
         ).withColumn(
             "healer_hps_on_tank",
             F.when(
-                (F.col("healer_fight_duration") > 0) & F.col("healer_hps_raw").isNotNull(),
-                F.col("healer_hps_raw") / (F.col("healer_fight_duration") / 1000.0),
+                (F.col("tank_fight_duration") > 0) & F.col("tank_healing_received").isNotNull(),
+                F.col("tank_healing_received") / (F.col("tank_fight_duration") / 1000.0),
             ).otherwise(F.lit(0.0)),
         )
 
@@ -802,9 +806,12 @@ class GoldPipeline:
     def compute_kpi_interrupt_rate(spark: SparkSession, season: str) -> DataFrame:
         """Compute KPI 3 — Interrupt Success Rate per player per run.
 
-        ISR = successful_interrupts / total_interrupt_casts
-
-        Edge case: if total_interrupt_casts == 0 → NULL (player didn't attempt).
+        ISR is computed from ``interrupts_count``, which records the number
+        of successful interrupts per player per fight.  WCL only returns
+        successful interrupt events — there is no "failed interrupt" event —
+        so ISR will always be 100% when data is available.  When
+        ``interrupts_count`` is 0 or NULL (player didn't attempt any
+        interrupts), ISR is NULL (not 0, which would imply they failed).
 
         Args:
             spark: Active SparkSession.
@@ -827,7 +834,8 @@ class GoldPipeline:
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
             return GoldPipeline._compute_interrupt_rate_from_raiderio(spark, rio_df, season)
 
-        # Register KPI UDF
+        # Register KPI UDF — since WCL only provides successful interrupts,
+        # ISR = successful / total, where both are the same count.
         interrupt_rate_udf = F.udf(
             lambda successful, total: compute_interrupt_rate(successful, total),
             returnType=DoubleType(),
@@ -837,8 +845,8 @@ class GoldPipeline:
         result = player_perf.withColumn(
             "interrupt_success_rate",
             interrupt_rate_udf(
-                F.coalesce(F.col("interrupts_successful"), F.lit(0)),
-                F.coalesce(F.col("interrupts_cast"), F.lit(0)),
+                F.coalesce(F.col("interrupts_count"), F.lit(0)),
+                F.coalesce(F.col("interrupts_count"), F.lit(0)),
             ),
         ).select(
             F.col("run_id"),
@@ -846,8 +854,7 @@ class GoldPipeline:
             F.col("class_name").alias("player_class"),
             F.col("spec_name").alias("player_spec"),
             F.col("role").alias("player_role"),
-            F.coalesce(F.col("interrupts_cast"), F.lit(0)).alias("total_interrupt_casts"),
-            F.coalesce(F.col("interrupts_successful"), F.lit(0)).alias("successful_interrupts"),
+            F.coalesce(F.col("interrupts_count"), F.lit(0)).alias("interrupts_count"),
             F.col("interrupt_success_rate"),
             F.lit(None).cast("int").alias("dangerous_enemy_casts"),
             F.lit(None).cast("double").alias("interrupt_coverage"),
@@ -897,8 +904,7 @@ class GoldPipeline:
             F.col("player.class").alias("player_class"),
             F.col("player.spec").alias("player_spec"),
             F.col("player.role").alias("player_role"),
-            F.lit(None).cast("int").alias("total_interrupt_casts"),
-            F.lit(None).cast("int").alias("successful_interrupts"),
+            F.lit(None).cast("int").alias("interrupts_count"),
             F.lit(None).cast("double").alias("interrupt_success_rate"),
             F.lit(None).cast("int").alias("dangerous_enemy_casts"),
             F.lit(None).cast("double").alias("interrupt_coverage"),

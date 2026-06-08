@@ -263,93 +263,172 @@ class SilverPipeline:
             healing_path = f"s3a://{settings.MINIO_BUCKET}/bronze/warcraftlogs/events/healing"
             healing_df = spark.read.parquet(healing_path)
 
-            # Aggregate damage taken per (report_code, fight_id, actor_id)
+            # Aggregate damage taken per (report_code, fight_id, player_name)
+            # DamageTaken table entries are per-target (the player who took damage),
+            # so player_name IS the damage target — this is correct.
             damage_agg = damage_df.groupBy(
-                F.col("report_code"), F.col("fight_id"), F.col("actor_id")
+                F.col("report_code"),
+                F.col("fight_id"),
+                F.lower(F.col("player_name")).alias("player_name"),
             ).agg(
                 F.sum("damage_amount").alias("total_damage_taken"),
-                F.count("*").alias("damage_events"),
             )
 
-            # Aggregate healing received per (report_code, fight_id, actor_id)
-            healing_agg = healing_df.groupBy(
-                F.col("report_code"), F.col("fight_id"), F.col("actor_id")
-            ).agg(
-                F.sum("damage_amount").alias("total_healing_received"),
-                F.count("*").alias("healing_events"),
-            )
+            # Aggregate healing RECEIVED per (report_code, fight_id, target_name).
+            # The WCL Healing table groups by source (healer), but new ingestion
+            # (Bug #1 fix) stores per-target rows with `target_name` populated.
+            # We aggregate by target_name so that each player gets the total
+            # healing they received, not the total healing they dealt.
+            # Fallback: for older data without target_name, group by player_name.
+            has_targets = "target_name" in healing_df.columns
+            if has_targets:
+                # Prefer target-level aggregation (healing RECEIVED by each player)
+                healing_received = healing_df.filter(
+                    F.col("target_name").isNotNull()
+                ).groupBy(
+                    F.col("report_code"),
+                    F.col("fight_id"),
+                    F.lower(F.col("target_name")).alias("player_name"),
+                ).agg(
+                    F.sum("damage_amount").alias("total_healing_received"),
+                )
+            else:
+                # Legacy data without target_name: aggregate by source (healer)
+                # NOTE: this gives healing DONE, not healing RECEIVED.
+                # KPI 2 (Healer Deficit) will be approximated with this.
+                healing_received = healing_df.groupBy(
+                    F.col("report_code"),
+                    F.col("fight_id"),
+                    F.lower(F.col("player_name")).alias("player_name"),
+                ).agg(
+                    F.sum("damage_amount").alias("total_healing_received"),
+                )
 
-            # Join damage + healing
-            combat_stats = damage_agg.join(
-                healing_agg,
-                on=["report_code", "fight_id", "actor_id"],
+            # Combine damage + healing received (full outer on name)
+            # damage_agg: total damage TAKEN by each player (correct)
+            # healing_received: total healing RECEIVED by each player (Bug #1 fix)
+            combat_by_player = damage_agg.join(
+                healing_received,
+                on=["report_code", "fight_id", "player_name"],
                 how="full_outer",
             ).fillna(0, subset=["total_damage_taken", "total_healing_received"])
 
-            # Join with dungeon_runs to get run_id and player info
-            # First, we need to join combat_stats with match manifest
-            # to get the rio_run_id, then with roster data
-            player_perf = combat_stats.join(
-                matches_df.select(
-                    F.col("wcl_report_code"),
-                    F.col("wcl_fight_id"),
-                    F.col("rio_run_id"),
-                ),
-                on=(
-                    (combat_stats["report_code"] == matches_df["wcl_report_code"])
-                    & (combat_stats["fight_id"] == matches_df["wcl_fight_id"])
-                ),
-                how="inner",
+            # Read interrupt events (now resolved with player_name via masterData)
+            interrupt_path = f"s3a://{settings.MINIO_BUCKET}/bronze/warcraftlogs/events/interrupts"
+            interrupt_df = spark.read.parquet(interrupt_path)
+
+            # Count interrupts per (report_code, fight_id, player_name)
+            # NOTE: WCL only returns successful interrupts — there is no "failed
+            # interrupt" event.  Both counters would always be identical, so we
+            # store a single `interrupts_count` instead of pretending we can
+            # distinguish cast vs successful.
+            # Normalize player_name to lowercase for matching
+            interrupt_agg = interrupt_df.filter(F.col("player_name").isNotNull()).groupBy(
+                F.col("report_code"),
+                F.col("fight_id"),
+                F.lower(F.col("player_name")).alias("player_name"),
+            ).agg(
+                F.count("*").alias("interrupts_count"),
             )
 
-            # Join with rio_df to get roster + fight duration
-            player_perf = player_perf.join(
-                rio_df.select(
-                    F.col("keystone_run_id"),
-                    F.col("clear_time_ms").alias("fight_duration_ms"),
-                    F.col("roster"),
-                ),
-                on=F.col("rio_run_id") == rio_df["keystone_run_id"],
-                how="left",
-            )
+            # Build player_performance from combat data joined by player_name
+            # Use player names from WCL events directly, join with roster flat
+            # (avoid struct field ordering issues by reading from source)
+            rio_path_flat = f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs"
+            rio_raw = spark.read.parquet(rio_path_flat).filter(F.col("season") == season)
+            roster_flat = rio_raw.select(
+                F.col("keystone_run_id"),
+                F.explode(F.col("roster")).alias("p"),
+            ).select(
+                F.col("keystone_run_id"),
+                F.expr("p.name").alias("player_name"),
+                F.expr("p.role").alias("role"),
+                F.expr("p.class").alias("class_name"),
+                F.expr("p.spec").alias("spec_name"),
+            ).distinct()
 
-            # Explode roster to match actor_id with player info
-            # This is a simplified version — in practice, masterData resolves actor IDs
-            # For now, we create player_performance from roster + aggregated combat stats
-            performance_rows = dungeon_runs.select(
+            # Get run metadata from dungeon_runs (which already has match manifest linked)
+            run_meta = dungeon_runs.select(
                 F.col("run_id"),
-                F.col("rio_run_id"),
+                F.col("season"),
+                F.col("clear_time_ms").alias("fight_duration_ms"),
                 F.col("wcl_report_code"),
                 F.col("wcl_fight_id"),
-                F.col("fight_duration_ms"),
-                F.col("season"),
-            ).join(
-                rio_df.select(
-                    F.col("keystone_run_id"),
-                    F.col("clear_time_ms").alias("fight_duration_ms"),
-                    F.explode(F.col("roster")).alias("player"),
-                ),
-                on=dungeon_runs["rio_run_id"] == rio_df["keystone_run_id"],
-                how="left",
-            ).select(
-                dungeon_runs["run_id"],
-                F.col("player.name").alias("player_name"),
-                F.col("player.realm").alias("realm"),
-                F.col("player.region").alias("region"),
-                F.col("player.class").alias("class_name"),
-                F.col("player.spec").alias("spec_name"),
-                F.col("player.role").alias("role"),
-                F.lit(None).cast("long").alias("total_damage_taken"),
-                F.lit(None).cast("long").alias("total_healing_received"),
-                F.lit(None).cast("int").alias("interrupts_cast"),
-                F.lit(None).cast("int").alias("interrupts_successful"),
-                F.lit(None).cast("long").alias("max_hp"),
-                dungeon_runs["fight_duration_ms"],
-                dungeon_runs["season"],
+                F.col("rio_run_id"),
+                F.col("roster"),
             )
 
+            # Join with flat roster to get player info
+            roster_with_meta = roster_flat.join(
+                run_meta,
+                on=F.col("keystone_run_id") == F.col("rio_run_id"),
+                how="inner",
+            ).select(
+                F.col("run_id"),
+                F.col("season"),
+                F.col("fight_duration_ms"),
+                F.col("wcl_report_code"),
+                F.col("wcl_fight_id"),
+                F.col("player_name"),
+                F.col("role"),
+                F.col("class_name"),
+                F.col("spec_name"),
+                F.lit(None).cast("string").alias("realm"),
+                F.lit(None).cast("string").alias("region"),
+            )
+
+            # 2. Rename roster cols to match combat_by_player for join
+            roster_for_join = roster_with_meta.select(
+                F.col("run_id"),
+                F.col("season"),
+                F.col("fight_duration_ms"),
+                F.col("wcl_report_code").alias("report_code"),
+                F.col("wcl_fight_id").alias("fight_id"),
+                F.lower(F.col("player_name")).alias("player_name"),
+                F.col("realm"),
+                F.col("region"),
+                F.col("class_name"),
+                F.col("spec_name"),
+                F.col("role").alias("player_role"),
+            )
+
+            # 3. Join with combat data (damage, healing) by (report_code, fight_id, player_name) — LEFT
+            player_perf_temp = roster_for_join.join(
+                combat_by_player,
+                on=["report_code", "fight_id", "player_name"],
+                how="left",
+            )
+
+            # 4. Join with interrupt data by (report_code, fight_id, player_name) — LEFT
+            player_perf_temp = player_perf_temp.join(
+                interrupt_agg,
+                on=["report_code", "fight_id", "player_name"],
+                how="left",
+            )
+
+            # 5. Select final columns
+            player_perf_df = player_perf_temp.select(
+                F.col("run_id"),
+                F.col("player_name"),
+                F.col("realm"),
+                F.col("region"),
+                F.col("class_name"),
+                F.col("spec_name"),
+                F.col("player_role").alias("role"),
+                F.when(F.col("total_damage_taken").isNotNull(), F.col("total_damage_taken"))
+                 .otherwise(F.lit(None).cast("long")).alias("total_damage_taken"),
+                F.when(F.col("total_healing_received").isNotNull(), F.col("total_healing_received"))
+                 .otherwise(F.lit(None).cast("long")).alias("total_healing_received"),
+                F.when(F.col("interrupts_count").isNotNull(), F.col("interrupts_count"))
+                 .otherwise(F.lit(None).cast("int")).alias("interrupts_count"),
+                F.lit(None).cast("long").alias("max_hp"),
+                F.col("fight_duration_ms"),
+                F.col("season"),
+            )
+
+            # Enforce schema
             player_perf_df = spark.createDataFrame(
-                performance_rows.rdd, schema=silver_player_performance_schema
+                player_perf_df.rdd, schema=silver_player_performance_schema
             )
 
         except Exception as e:
@@ -414,8 +493,7 @@ def _build_player_perf_from_roster(
         F.col("player.role").alias("role"),
         F.lit(None).cast("long").alias("total_damage_taken"),
         F.lit(None).cast("long").alias("total_healing_received"),
-        F.lit(None).cast("int").alias("interrupts_cast"),
-        F.lit(None).cast("int").alias("interrupts_successful"),
+        F.lit(None).cast("int").alias("interrupts_count"),
         F.lit(None).cast("long").alias("max_hp"),
         F.lit(None).cast("long").alias("fight_duration_ms"),
         F.col("season"),

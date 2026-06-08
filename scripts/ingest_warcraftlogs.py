@@ -63,20 +63,25 @@ def ingest_damage_taken(
     """
     events = []
     try:
-        table = wcl_client.get_table(report_code, fight_ids, "DamageTaken")
-        entries = table.get("entries", [])
-        for entry in entries:
-            events.append({
-                "timestamp": entry.get("timestamp", 0),
-                "actor_id": entry.get("id", 0),
-                "source_id": entry.get("sourceID"),
-                "ability_id": entry.get("ability", {}).get("gameID", 0),
-                "ability_name": entry.get("ability", {}).get("name", ""),
-                "damage_amount": entry.get("total", 0),
-                "damage_type": entry.get("type", ""),
-                "fight_id": fight_ids[0] if len(fight_ids) == 1 else 0,
-                "report_code": report_code,
-            })
+        for fid in fight_ids:
+            table = wcl_client.get_table(report_code, [fid], "DamageTaken")
+            table_data = table.get("data", {})
+            entries = table_data.get("entries", []) if isinstance(table_data, dict) else table.get("entries", [])
+            for entry in entries:
+                events.append({
+                    "timestamp": 0,
+                    "actor_id": entry.get("id", 0),
+                    "player_name": entry.get("name", ""),
+                    "source_id": entry.get("sourceID"),
+                    "target_id": None,
+                    "target_name": None,
+                    "ability_id": 0,
+                    "ability_name": entry.get("type", ""),
+                    "damage_amount": entry.get("total", 0),
+                    "damage_type": "damage_taken",
+                    "fight_id": fid,
+                    "report_code": report_code,
+                })
     except (WCLRateLimitError, Exception) as e:
         logger.warning("Failed to fetch DamageTaken for %s fight %s: %s", report_code, fight_ids, e)
     return events
@@ -86,33 +91,83 @@ def ingest_healing(
     wcl_client: WarcraftLogsClient,
     report_code: str,
     fight_ids: list[int],
+    actor_map: dict[int, str] | None = None,
 ) -> list[dict]:
     """Fetch Healing table data for given fights.
+
+    Extracts per-TARGET healing from the WCL Healing table entries.
+    Each source (healer) entry may contain a ``targets`` sub-array
+    showing how much each target received.  When targets are available,
+    we emit one row per (healer → target) pair so that the Silver
+    layer can aggregate healing RECEIVED by each player (not just
+    healing DONE by each healer).
+
+    Falls back to source-level rows when ``targets`` is absent,
+    retaining backward compatibility with older ingestion runs.
 
     Args:
         wcl_client: Authenticated WCL client.
         report_code: WCL report code.
         fight_ids: List of fight IDs.
+        actor_map: Dict mapping actor_id → player_name from masterData.
 
     Returns:
-        List of healing event dicts.
+        List of healing event dicts with target_name populated where available.
     """
     events = []
     try:
-        table = wcl_client.get_table(report_code, fight_ids, "Healing")
-        entries = table.get("entries", [])
-        for entry in entries:
-            events.append({
-                "timestamp": entry.get("timestamp", 0),
-                "actor_id": entry.get("id", 0),
-                "source_id": entry.get("sourceID"),
-                "ability_id": entry.get("ability", {}).get("gameID", 0),
-                "ability_name": entry.get("ability", {}).get("name", ""),
-                "damage_amount": 0,  # healing, not damage
-                "damage_type": "healing",
-                "fight_id": fight_ids[0] if len(fight_ids) == 1 else 0,
-                "report_code": report_code,
-            })
+        for fid in fight_ids:
+            table = wcl_client.get_table(report_code, [fid], "Healing")
+            table_data = table.get("data", {})
+            entries = table_data.get("entries", []) if isinstance(table_data, dict) else table.get("entries", [])
+
+            for entry in entries:
+                source_id = entry.get("id", 0)
+                source_name = entry.get("name", "")
+
+                # Try to extract per-target healing breakdown
+                targets = entry.get("targets", [])
+                if targets and isinstance(targets, list):
+                    # Per-target breakdown available — emit one row per target
+                    for target in targets:
+                        target_id = target.get("id")
+                        target_name_raw = target.get("name", "")
+                        # Resolve target_name via actor_map if available
+                        target_name = (
+                            (actor_map or {}).get(target_id, target_name_raw)
+                            if target_id is not None
+                            else target_name_raw
+                        )
+                        events.append({
+                            "timestamp": 0,
+                            "actor_id": source_id,
+                            "player_name": source_name,
+                            "source_id": source_id,
+                            "target_id": target_id,
+                            "target_name": target_name,
+                            "ability_id": 0,
+                            "ability_name": entry.get("type", ""),
+                            "damage_amount": target.get("total", 0),
+                            "damage_type": "healing",
+                            "fight_id": fid,
+                            "report_code": report_code,
+                        })
+                else:
+                    # No target breakdown — emit source-level row (backward compat)
+                    events.append({
+                        "timestamp": 0,
+                        "actor_id": source_id,
+                        "player_name": source_name,
+                        "source_id": source_id,
+                        "target_id": None,
+                        "target_name": None,
+                        "ability_id": 0,
+                        "ability_name": entry.get("type", ""),
+                        "damage_amount": entry.get("total", 0),
+                        "damage_type": "healing",
+                        "fight_id": fid,
+                        "report_code": report_code,
+                    })
     except (WCLRateLimitError, Exception) as e:
         logger.warning("Failed to fetch Healing for %s fight %s: %s", report_code, fight_ids, e)
     return events
@@ -122,32 +177,42 @@ def ingest_interrupts(
     wcl_client: WarcraftLogsClient,
     report_code: str,
     fight_ids: list[int],
+    actor_map: dict[int, str] | None = None,
 ) -> list[dict]:
     """Fetch Interrupt events for given fights.
+
+    Resolves actor_id → player_name via masterData (actor_map).
 
     Args:
         wcl_client: Authenticated WCL client.
         report_code: WCL report code.
         fight_ids: List of fight IDs.
+        actor_map: Dict mapping actor_id → player_name from masterData.
 
     Returns:
-        List of interrupt event dicts.
+        List of interrupt event dicts with resolved player_name.
     """
     events = []
     try:
-        raw_events = wcl_client.get_events(report_code, fight_ids, "Interrupts")
-        for evt in raw_events:
-            events.append({
-                "timestamp": evt.get("timestamp", 0),
-                "actor_id": evt.get("sourceID", 0),
-                "source_id": evt.get("sourceID"),
-                "ability_id": evt.get("ability", {}).get("gameID", 0),
-                "ability_name": evt.get("ability", {}).get("name", ""),
-                "damage_amount": 0,
-                "damage_type": "interrupt",
-                "fight_id": fight_ids[0] if len(fight_ids) == 1 else 0,
-                "report_code": report_code,
-            })
+        for fid in fight_ids:
+            raw_events = wcl_client.get_events(report_code, [fid], "Interrupts")
+            for evt in raw_events:
+                source_id = evt.get("sourceID", 0)
+                player_name = (actor_map or {}).get(source_id)
+                events.append({
+                    "timestamp": evt.get("timestamp", 0),
+                    "actor_id": source_id,
+                    "player_name": player_name,
+                    "source_id": source_id,
+                    "target_id": evt.get("targetID"),
+                    "target_name": None,
+                    "ability_id": evt.get("abilityGameID", 0),
+                    "ability_name": str(evt.get("abilityGameID", "")),
+                    "damage_amount": 0,
+                    "damage_type": "interrupt",
+                    "fight_id": fid,
+                    "report_code": report_code,
+                })
     except (WCLRateLimitError, Exception) as e:
         logger.warning("Failed to fetch Interrupts for %s fight %s: %s", report_code, fight_ids, e)
     return events
@@ -309,21 +374,34 @@ def main() -> None:
                 i, total_reports, report_code, len(fight_ids),
             )
 
+            # Fetch masterData for actor_id → player_name resolution
+            actor_map: dict[int, str] = {}
+            try:
+                master_data = wcl_client.get_master_data(report_code)
+                for actor in master_data.get("actors", []):
+                    if actor.get("type") == "Player":
+                        aid = actor.get("id")
+                        aname = actor.get("name", "")
+                        if aid and aname:
+                            actor_map[aid] = aname
+            except Exception as e:
+                logger.warning("Failed to fetch masterData for %s: %s", report_code, e)
+
             # Fetch DamageTaken events
             if not args.skip_damage:
                 damage_events = ingest_damage_taken(wcl_client, report_code, fight_ids)
                 all_damage_events.extend(damage_events)
                 logger.info("  DamageTaken: %d events", len(damage_events))
 
-            # Fetch Healing events
+            # Fetch Healing events (+ resolve target_name via masterData)
             if not args.skip_healing:
-                healing_events = ingest_healing(wcl_client, report_code, fight_ids)
+                healing_events = ingest_healing(wcl_client, report_code, fight_ids, actor_map)
                 all_healing_events.extend(healing_events)
                 logger.info("  Healing: %d events", len(healing_events))
 
-            # Fetch Interrupt events
+            # Fetch Interrupt events + resolve player_name via masterData
             if not args.skip_interrupts:
-                interrupt_events = ingest_interrupts(wcl_client, report_code, fight_ids)
+                interrupt_events = ingest_interrupts(wcl_client, report_code, fight_ids, actor_map)
                 all_interrupt_events.extend(interrupt_events)
                 logger.info("  Interrupts: %d events", len(interrupt_events))
 
