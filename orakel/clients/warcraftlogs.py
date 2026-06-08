@@ -267,7 +267,7 @@ class WarcraftLogsClient:
         """Fetch recent WCL reports for a character, including fights data.
 
         Automatically paginates across multiple pages to find M+ reports
-        (zone 45 = TWW Season 3 Mythic+).
+        (zones 45, 43, 47 = TWW S3, S2, S1 Mythic+).
 
         Args:
             character_name: Character name (e.g. "Jinskii").

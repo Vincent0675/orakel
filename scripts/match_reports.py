@@ -547,10 +547,10 @@ def run_fuzzy_join(
             fights = report.get("fights", [])
 
             # Skip non-M+ reports by zone
-            # Zone 45 = Mythic+ Season 3 (TWW), Zone 47 = Mythic+ Season 1
+            # 45 = TWW S3 (current), 43 = TWW S2, 47 = TWW S1
             report_zone = report.get("zone", {})
             zone_id = report_zone.get("id") if isinstance(report_zone, dict) else report_zone
-            if zone_id not in (45, 47):
+            if zone_id not in (45, 43, 47):
                 continue
 
             if not fights:
