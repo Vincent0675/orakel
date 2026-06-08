@@ -12,6 +12,7 @@ import uuid
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType
 from pyspark.sql.window import Window
 
 from orakel.config import settings
@@ -72,15 +73,9 @@ class SilverPipeline:
         # ── Flatten nested structs ─────────────────────────────────────────
         # roster[].realm is a struct {id, slug, name, ...} → extract slug
         # roster[].region is a struct {name, slug, short_name} → extract short_name
-        transformed_roster = F.transform(
-            F.col("roster"),
-            lambda p: p.withField("realm", p.getField("realm").getField("slug"))
-            .withField(
-                "region", p.getField("region").getField("short_name")
-            ),
-        )
-
-        silver_df = deduped_df.withColumn("roster", transformed_roster)
+        # On re-execution, these fields may already be strings (pre-flattened),
+        # so use the idempotent _flatten_roster helper.
+        silver_df = deduped_df.withColumn("roster", SilverPipeline._flatten_roster(deduped_df, F.col("roster")))
 
         # ── Filter by season ───────────────────────────────────────────────
         silver_df = silver_df.filter(F.col("season") == season)
@@ -104,20 +99,53 @@ class SilverPipeline:
         return silver_df
 
     @staticmethod
-    def _flatten_roster(roster_col: F.Column) -> F.Column:
+    def _flatten_roster(deduped_df: DataFrame, roster_col: F.Column) -> F.Column:
         """Flatten roster structs: extract realm.slug and region.short_name.
 
         Handles both struct and already-flat string types (idempotent).
+        Type check is performed at schema level BEFORE building the
+        transformation expression, because PySpark lambdas cannot inspect
+        field types at expression-evaluation time.
         """
-        return F.transform(
-            roster_col,
-            lambda p: p.withField("realm", p.getField("realm").getField("slug")
-                                  if p.getField("realm").getType().typeName() != "string"
-                                  else p.getField("realm"))
-            .withField("region", p.getField("region").getField("short_name")
-                       if p.getField("region").getType().typeName() != "string"
-                       else p.getField("region")),
+        roster_array_type = deduped_df.schema["roster"].dataType
+        element_type = roster_array_type.elementType
+
+        realm_is_struct = (
+            isinstance(element_type, StructType)
+            and "realm" in element_type.fieldNames()
+            and element_type["realm"].dataType.typeName() == "struct"
         )
+        region_is_struct = (
+            isinstance(element_type, StructType)
+            and "region" in element_type.fieldNames()
+            and element_type["region"].dataType.typeName() == "struct"
+        )
+
+        if realm_is_struct and region_is_struct:
+            # Both still structs — full flatten
+            return F.transform(
+                roster_col,
+                lambda p: p.dropFields("realm", "region")
+                .withField("realm", p.getField("realm").getField("slug"))
+                .withField("region", p.getField("region").getField("short_name")),
+            )
+        elif realm_is_struct:
+            # Only realm is still a struct
+            return F.transform(
+                roster_col,
+                lambda p: p.dropFields("realm")
+                .withField("realm", p.getField("realm").getField("slug")),
+            )
+        elif region_is_struct:
+            # Only region is still a struct
+            return F.transform(
+                roster_col,
+                lambda p: p.dropFields("region")
+                .withField("region", p.getField("region").getField("short_name")),
+            )
+        else:
+            # Both already flat strings — nothing to do
+            return roster_col
 
     @staticmethod
     def apply_fuzzy_join(spark: SparkSession, season: str) -> tuple[DataFrame, DataFrame]:
