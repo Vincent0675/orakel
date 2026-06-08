@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -188,6 +189,74 @@ class WarcraftLogsClient:
 
         return result
 
+    def _fetch_reports_page(
+        self,
+        character_name: str,
+        server_slug: str,
+        region: str,
+        page: int,
+        limit: int = 20,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Fetch a single page of recent reports for a character.
+
+        Args:
+            character_name: Cleaned character name.
+            server_slug: Server slug.
+            region: Region code.
+            page: Page number (1-indexed).
+            limit: Reports per page (max 20 for complexity).
+
+        Returns:
+            Tuple of (reports_list, guilds_list).
+        """
+        query = """
+        query GetRecentReportsPage($name: String!, $serverSlug: String!, $serverRegion: String!, $limit: Int!, $page: Int!) {
+            characterData {
+                character(name: $name, serverSlug: $serverSlug, serverRegion: $serverRegion) {
+                    guilds { id name }
+                    recentReports(limit: $limit, page: $page) {
+                        data {
+                            code
+                            startTime
+                            endTime
+                            zone { id }
+                            fights {
+                                id
+                                encounterID
+                                keystoneLevel
+                                keystoneAffixes
+                                keystoneTime
+                                kill
+                                startTime
+                                endTime
+                            }
+                        }
+                    }
+                }
+            }
+            rateLimitData {
+                limitPerHour
+                pointsSpentThisHour
+                pointsResetIn
+            }
+        }
+        """
+        result = self.query(query, {
+            "name": character_name,
+            "serverSlug": server_slug,
+            "serverRegion": region,
+            "limit": limit,
+            "page": page,
+        })
+        char_data = result.get("data", {}).get("characterData", {}).get("character")
+        if not char_data:
+            return [], []
+
+        pagination = char_data.get("recentReports", {})
+        reports = pagination.get("data", []) if isinstance(pagination, dict) else []
+        guilds = char_data.get("guilds", [])
+        return reports, guilds
+
     def get_recent_reports(
         self,
         character_name: str,
@@ -197,8 +266,8 @@ class WarcraftLogsClient:
     ) -> list[dict[str, Any]]:
         """Fetch recent WCL reports for a character, including fights data.
 
-        Queries character.recentReports with nested fights, returning
-        a list of report dicts each containing a 'fights' list with M+ metadata.
+        Automatically paginates across multiple pages to find M+ reports
+        (zone 45 = TWW Season 3 Mythic+).
 
         Args:
             character_name: Character name (e.g. "Jinskii").
@@ -209,56 +278,51 @@ class WarcraftLogsClient:
         Returns:
             List of report dicts with nested fights data.
         """
-        # Estimate point cost: ~15 per report, capped at limit*15
         estimated_cost = min(limit * 15, 3600)
         if not self.rate_limiter.wait_if_needed(estimated_cost):
             raise WCLRateLimitError("WCL point budget exhausted, cannot fetch recent reports")
 
-        query = """
-        query GetRecentReports($name: String!, $serverSlug: String!, $serverRegion: String!, $limit: Int!) {
-            characterData {
-                character(name: $name, serverSlug: $serverSlug, serverRegion: $serverRegion) {
-                    recentReports(limit: $limit) {
-                        code
-                        title
-                        zoneID
-                        startTime
-                        endTime
-                        owner { name }
-                        guild { name }
-                        visibility
-                        fights {
-                            id
-                            encounterID
-                            keystoneLevel
-                            keystoneAffixes { id }
-                            keystoneTime
-                            kill
-                            startTime
-                            endTime
-                        }
-                    }
-                }
-            }
-        }
-        """
+        clean_name = re.sub(r'-\d+$', '', character_name)
 
-        variables = {
-            "name": character_name,
-            "serverSlug": server_slug,
-            "serverRegion": region,
-            "limit": limit,
-        }
+        all_reports: list[dict[str, Any]] = []
+        all_guilds: list[dict[str, Any]] = []
+        page = 1
+        max_pages = max(1, min(5, (limit + 19) // 20))  # 5 pages max = 100 reports
 
-        result = self.query(query, variables)
-        character_data = result.get("data", {}).get("characterData", {}).get("character")
-        if not character_data:
-            logger.warning("No character data returned for %s on %s-%s", character_name, server_slug, region)
-            return []
+        while page <= max_pages:
+            reports, guilds = self._fetch_reports_page(
+                clean_name, server_slug, region, page
+            )
+            if not reports:
+                break
 
-        reports = character_data.get("recentReports", [])
-        logger.info("Found %d recent reports for %s on %s-%s", len(reports), character_name, server_slug, region)
-        return reports
+            # Store guild info from first page
+            if page == 1 and guilds:
+                all_guilds = guilds
+
+            # Filter to M+ zones (45 = TWW S3, 43 = TWW S2, 47 = TWW S1)
+            for r in reports:
+                zone = r.get("zone", {})
+                zone_id = zone.get("id") if isinstance(zone, dict) else zone
+                r["_zone_id"] = zone_id
+                if zone_id in (45, 43, 47):
+                    all_reports.append(r)
+
+            # Check if we already have enough M+ reports (stop fetching more pages)
+            if len(all_reports) >= 10:
+                break
+
+            page += 1
+
+        # If no M+ reports found, return ALL reports (for broader search)
+        if not all_reports:
+            logger.debug("No M+ zone reports found for %s in pages 1-%d", clean_name, page)
+
+        logger.info(
+            "Found %d M+ reports for %s on %s-%s (checked %d pages)",
+            len(all_reports), clean_name, server_slug, region, page,
+        )
+        return all_reports
 
     def get_fights(self, report_code: str) -> list[dict[str, Any]]:
         """Fetch the fight list for a WCL report.
@@ -383,8 +447,9 @@ class WarcraftLogsClient:
     ) -> list[dict[str, Any]]:
         """Fetch raw events from WCL for specific fights.
 
-        Used for Interrupt events (KPI 3). The WCL API paginates events
-        with a page-based cursor.
+        Used for Interrupt events (KPI 3). WCL events query returns
+        a ReportEventPaginator with ``data`` as a JSON list and
+        ``nextPageTimestamp`` for pagination.
 
         Args:
             report_code: WCL report code.
@@ -395,7 +460,6 @@ class WarcraftLogsClient:
             List of event dicts.
         """
         all_events: list[dict[str, Any]] = []
-        # Events cost ~150 points per query
         if not self.rate_limiter.wait_if_needed(150):
             raise WCLRateLimitError(f"WCL point budget exhausted, cannot fetch {data_type} events")
 
@@ -403,7 +467,10 @@ class WarcraftLogsClient:
         query GetEvents($code: String!, $fightIDs: [Int]!, $dataType: EventDataType!) {
             reportData {
                 report(code: $code) {
-                    events(dataType: $dataType, fightIDs: $fightIDs)
+                    events(dataType: $dataType, fightIDs: $fightIDs) {
+                        data
+                        nextPageTimestamp
+                    }
                 }
             }
         }
@@ -420,8 +487,11 @@ class WarcraftLogsClient:
         events_data = report_data.get("events", {})
 
         if isinstance(events_data, dict):
-            all_events.extend(events_data.get("data", events_data.get("entries", [])))
-        elif isinstance(events_data, list):
-            all_events.extend(events_data)
+            # data field is a raw JSON list (no sub-fields allowed)
+            raw_data = events_data.get("data", [])
+            if isinstance(raw_data, list):
+                all_events.extend(raw_data)
+            elif isinstance(raw_data, dict):
+                all_events.extend(raw_data.get("entries", raw_data.get("data", [])))
 
         return all_events
