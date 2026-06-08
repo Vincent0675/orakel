@@ -82,9 +82,9 @@ def compute_healer_deficit(
     Returns:
         Tuple of (deficit_ratio, category).
     """
-    if healer_hps <= 0:
-        # No healing → infinite deficit
-        return (float("inf"), "critical")
+    if tank_dtps <= 0 or healer_hps <= 0:
+        # Zero or negative DTPS/HPS produces NaN or inf — return None instead
+        return (None, None)
 
     ratio = tank_dtps / healer_hps
 

@@ -127,19 +127,19 @@ Chain strategy: pending
 
 ## Phase 3: WCL Integration + KPIs 1–3
 
-- [ ] 3.1 Create `orakel/clients/warcraftlogs.py` — GraphQL+OAuth client with point tracking
+- [x] 3.1 Create `orakel/clients/warcraftlogs.py` — GraphQL+OAuth client with point tracking
   - **Files**: `orakel/clients/warcraftlogs.py`
   - **Deps**: 1.3
   - **Effort**: L
   - **Acceptance**: `WarcraftLogsClient.get_token()` returns access token; `WarcraftLogsClient.fetch_fights(report_code)` returns parsed fights; point budget tracked and resumable
 
-- [ ] 3.2 Create `orakel/utils/rate_limiter.py` — token-bucket for WCL
+- [x] 3.2 Create `orakel/utils/rate_limiter.py` — token-bucket for WCL
   - **Files**: `orakel/utils/rate_limiter.py`
   - **Deps**: None
   - **Effort**: S
   - **Acceptance**: `TokenBucketRateLimiter.consume(cost)` sleeps when budget exhausted; `Retry-After` header respected; 3 retries then abort with logged error
 
-- [ ] 3.3 Create `scripts/match_reports.py` — fuzzy join engine with stratified tank sampling
+- [x] 3.3 Create `scripts/match_reports.py` — fuzzy join engine with stratified tank sampling
   - **Files**: `scripts/match_reports.py`
   - **Deps**: 1.6, 3.1, 3.2, 1.4
   - **Effort**: XL
@@ -151,25 +151,25 @@ Chain strategy: pending
   - **Effort**: M
   - **Acceptance**: `silver/matches/` contains ≥1 match; confidence scores distributed (not all 0.2); match_method values include `"full_3_layer"` or `"rio_only"`
 
-- [ ] 3.5 Create `scripts/ingest_warcraftlogs.py` — fetch WCL events for matched runs
+- [x] 3.5 Create `scripts/ingest_warcraftlogs.py` — fetch WCL events for matched runs
   - **Files**: `scripts/ingest_warcraftlogs.py`
   - **Deps**: 3.1, 3.2, 3.4, 1.4, 1.5
   - **Effort**: L
   - **Acceptance**: Reads match manifest; fetches DamageTaken, HealingDone, Interrupts events per fight; writes to `bronze/warcraftlogs/events/` partitioned by `report_code/fight_id`
 
-- [ ] 3.6 Update `orakel/pipeline/silver.py` — add fuzzy join integration using match manifest
+- [x] 3.6 Update `orakel/pipeline/silver.py` — add fuzzy join integration using match manifest
   - **Files**: `orakel/pipeline/silver.py`
   - **Deps**: 2.2, 3.4
   - **Effort**: M
   - **Acceptance**: `SilverPipeline.apply_fuzzy_join()` reads match manifest; joins WCL events to Raider.IO runs; produces `silver/dungeon_runs/` and `silver/player_performance/`
 
-- [ ] 3.7 Update `scripts/bronze_to_silver.py` — add WCL data processing
+- [x] 3.7 Update `scripts/bronze_to_silver.py` — add WCL data processing
   - **Files**: `scripts/bronze_to_silver.py`
   - **Deps**: 3.5, 3.6
   - **Effort**: S
   - **Acceptance**: Script processes both Raider.IO runs AND WCL events; both land in Silver
 
-- [ ] 3.8 Update `orakel/pipeline/gold.py` — compute KPIs 1–3 (Death Clock, Healer Deficit, Interrupt Rate)
+- [x] 3.8 Update `orakel/pipeline/gold.py` — compute KPIs 1–3 (Death Clock, Healer Deficit, Interrupt Rate)
   - **Files**: `orakel/pipeline/gold.py`
   - **Deps**: 2.5, 3.6
   - **Effort**: L
