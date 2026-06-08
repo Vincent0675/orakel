@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pyspark.sql.types import (
     ArrayType,
+    BooleanType,
     DoubleType,
     IntegerType,
     LongType,
@@ -303,8 +304,8 @@ dim_spec_schema = StructType(
         StructField("class_name", StringType(), nullable=True),
         StructField("spec_name", StringType(), nullable=True),
         StructField("role", StringType(), nullable=True),
-        StructField("is_healer", StringType(), nullable=True),
-        StructField("is_tank", StringType(), nullable=True),
-        StructField("is_dps", StringType(), nullable=True),
+        StructField("is_healer", BooleanType(), nullable=True),
+        StructField("is_tank", BooleanType(), nullable=True),
+        StructField("is_dps", BooleanType(), nullable=True),
     ]
 )
