@@ -29,6 +29,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import requests
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -41,7 +43,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from orakel.clients.warcraftlogs import WCLAuthError, WarcraftLogsClient
+from orakel.clients.warcraftlogs import WCLAuthError, WCLRateLimitError, WarcraftLogsClient
 from orakel.config import settings
 from orakel.utils.minio import get_spark_session
 
@@ -537,8 +539,8 @@ def run_fuzzy_join(
                 region=tank_region,
                 limit=100,
             )
-        except Exception as e:
-            logger.warning("Failed to fetch reports for tank %s: %s", tank_name, e)
+        except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
+            logger.warning("Failed to fetch reports for tank %s (%s): %s", tank_name, type(e).__name__, e)
             continue
 
         for report in reports:
@@ -557,8 +559,8 @@ def run_fuzzy_join(
                 # Fetch fights separately if not included
                 try:
                     fights = wcl_client.get_fights(report_code)
-                except Exception as e:
-                    logger.warning("Failed to fetch fights for report %s: %s", report_code, e)
+                except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
+                    logger.warning("Failed to fetch fights for report %s (%s): %s", report_code, type(e).__name__, e)
                     continue
 
             # Find M+ fights (have keystoneLevel)
@@ -587,9 +589,12 @@ def run_fuzzy_join(
                 try:
                     master_data = wcl_client.get_master_data(report_code)
                     wcl_actors = master_data.get("actors", [])
-                except Exception as e:
+                except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
                     logger.warning(
-                        "Failed to fetch master data for %s: %s", report_code, e
+                        "Failed to fetch master data for %s (%s): %s",
+                        report_code,
+                        type(e).__name__,
+                        e,
                     )
 
                 for fight in candidates:
@@ -755,8 +760,8 @@ def main() -> None:
         logger.info("  Total matches: %d", len(matches))
         logger.info("=" * 60)
 
-    except Exception:
-        logger.exception("Fuzzy join failed")
+    except Exception as e:
+        logger.exception("Fuzzy join failed [%s]", type(e).__name__)
         sys.exit(1)
     finally:
         spark.stop()

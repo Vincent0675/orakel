@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from py4j.protocol import Py4JError
+from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
@@ -178,11 +180,13 @@ class SilverPipeline:
             )
             match_count = matches_df.count()
             logger.info("Match manifest: %d records", match_count)
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
             logger.warning(
-                "No match manifest found at %s. "
+                "No match manifest found at %s (%s: %s). "
                 "Run match_reports.py first to create it.",
                 matches_path,
+                type(e).__name__,
+                e,
             )
             # Return Raider.IO-only runs with WCL columns set to null
             rio_only = rio_df.withColumn("run_id", F.expr("uuid()")) \
@@ -431,10 +435,11 @@ class SilverPipeline:
                 player_perf_df.rdd, schema=silver_player_performance_schema
             )
 
-        except Exception as e:
+        except (AnalysisException, Py4JError, OSError) as e:
             logger.warning(
-                "Could not build player_performance from WCL data: %s. "
+                "Could not build player_performance from WCL data (%s: %s). "
                 "Creating empty player_performance from roster data.",
+                type(e).__name__,
                 e,
             )
             # Fallback: create player_performance from roster without combat stats

@@ -17,6 +17,8 @@ import logging
 import sys
 from datetime import datetime, timezone
 
+import requests
+
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -384,8 +386,8 @@ def main() -> None:
                         aname = actor.get("name", "")
                         if aid and aname:
                             actor_map[aid] = aname
-            except Exception as e:
-                logger.warning("Failed to fetch masterData for %s: %s", report_code, e)
+            except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
+                logger.warning("Failed to fetch masterData for %s (%s): %s", report_code, type(e).__name__, e)
 
             # Fetch DamageTaken events
             if not args.skip_damage:
@@ -434,8 +436,8 @@ def main() -> None:
         logger.info("  Total WCL points spent: %d", wcl_client.rate_limiter.total_spent)
         logger.info("=" * 60)
 
-    except Exception:
-        logger.exception("WCL events ingestion failed")
+    except Exception as e:
+        logger.exception("WCL events ingestion failed [%s]", type(e).__name__)
         sys.exit(1)
     finally:
         spark.stop()

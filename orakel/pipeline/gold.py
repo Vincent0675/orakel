@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 
+from py4j.protocol import Py4JError
+from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -469,10 +471,12 @@ class GoldPipeline:
             player_perf = spark.read.parquet(pp_path).filter(
                 F.col("season") == season
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
             logger.warning(
-                "silver/player_performance not found. "
-                "Computing KPI 1 from Raider.IO-only Silver data."
+                "silver/player_performance not found (%s: %s). "
+                "Computing KPI 1 from Raider.IO-only Silver data.",
+                type(e).__name__,
+                e,
             )
             # Fallback: use silver/raiderio_runs with estimated stats
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
@@ -528,9 +532,13 @@ class GoldPipeline:
                 on="run_id",
                 how="left",
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
             # If no dungeon_runs, use player_perf data directly
-            logger.warning("silver/dungeon_runs not found, using raiderio_runs fallback.")
+            logger.warning(
+                "silver/dungeon_runs not found (%s: %s), using raiderio_runs fallback.",
+                type(e).__name__,
+                e,
+            )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
             return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
@@ -661,10 +669,12 @@ class GoldPipeline:
             player_perf = spark.read.parquet(pp_path).filter(
                 F.col("season") == season
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
             logger.warning(
-                "silver/player_performance not found. "
-                "Computing KPI 2 from Raider.IO-only data."
+                "silver/player_performance not found (%s: %s). "
+                "Computing KPI 2 from Raider.IO-only data.",
+                type(e).__name__,
+                e,
             )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
@@ -757,7 +767,12 @@ class GoldPipeline:
                 on="run_id",
                 how="left",
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
+            logger.warning(
+                "silver/dungeon_runs not found for affix join (%s: %s), using null affix_ids.",
+                type(e).__name__,
+                e,
+            )
             result = result.withColumn("affix_ids", F.lit(None).cast("array<int>"))
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
@@ -825,10 +840,12 @@ class GoldPipeline:
             player_perf = spark.read.parquet(pp_path).filter(
                 F.col("season") == season
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
             logger.warning(
-                "silver/player_performance not found. "
-                "Computing KPI 3 from Raider.IO-only data."
+                "silver/player_performance not found (%s: %s). "
+                "Computing KPI 3 from Raider.IO-only data.",
+                type(e).__name__,
+                e,
             )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
@@ -870,7 +887,13 @@ class GoldPipeline:
                 on="run_id",
                 how="left",
             )
-        except Exception:
+        except (AnalysisException, Py4JError, OSError) as e:
+            logger.warning(
+                "silver/dungeon_runs not found for interrupt join (%s: %s), "
+                "using null dangerous_enemy_casts and interrupt_coverage.",
+                type(e).__name__,
+                e,
+            )
             result = result.withColumn(
                 "dangerous_enemy_casts",
                 F.lit(None).cast("int"),
