@@ -22,7 +22,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import re
 import sys
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -209,7 +211,12 @@ def match_layer1(
     rio_run: dict,
     wcl_fights: list[dict],
 ) -> list[dict]:
-    """Layer 1: exact match on challenge_mode_id, keystone_level, and affixes.
+    """Layer 1: exact match on keystone_level and affixes.
+
+    NOTE: WCL encounterIDs do NOT match Raider.IO challenge_mode_ids
+    (they use different numbering systems). We rely on key_level + affixes
+    for the first filter, then Layer 2 (timestamp) and Layer 3 (roster)
+    for disambiguation.
 
     Args:
         rio_run: Raider.IO run row dict.
@@ -218,28 +225,26 @@ def match_layer1(
     Returns:
         List of candidate fights matching Layer 1.
     """
-    rio_encounter_id = rio_run.get("challenge_mode_id")
     rio_level = rio_run.get("mythic_level")
     rio_affixes = set(rio_run.get("weekly_modifiers", []) or [])
 
-    if rio_encounter_id is None:
+    if rio_level is None:
         return []
 
     candidates = []
     for fight in wcl_fights:
-        wcl_encounter = fight.get("encounterID") or fight.get("encounter_id")
         wcl_level = fight.get("keystoneLevel") or fight.get("keystone_level")
         wcl_affixes = set(
             (a.get("id") if isinstance(a, dict) else a)
             for a in (fight.get("keystoneAffixes") or [])
         )
 
-        if wcl_encounter is None or wcl_level is None:
+        if wcl_level is None:
             continue
 
-        if wcl_encounter == rio_encounter_id and wcl_level == rio_level:
-            # Affixes must match (sorted comparison)
-            if not rio_affixes or rio_affixes == wcl_affixes or rio_affixes.issubset(wcl_affixes):
+        if wcl_level == rio_level:
+            # Affixes must match (as sets, order-independent)
+            if not rio_affixes or rio_affixes == wcl_affixes:
                 candidates.append(fight)
 
     return candidates
@@ -300,6 +305,50 @@ def match_layer2(
     return time_diff_s <= tolerance_seconds, time_diff_s
 
 
+def _normalize_name(name: str) -> str:
+    """Normalize a character name for cross-reference matching.
+
+    - Lowercase
+    - Strip trailing -numeric suffix (Raider.IO disambiguation)
+    - Unicode NFKC normalization (CJK, Cyrillic, accents)
+    """
+    name = unicodedata.normalize("NFKC", name.strip().lower())
+    name = re.sub(r'-\d+$', '', name)
+    return name
+
+
+def _normalize_realm(realm: str) -> set[str]:
+    """Normalize a realm/server name into candidate formats for matching.
+
+    WCL and Raider.IO may use different formats:
+    - "howling-fjord" (slug) vs "Howling Fjord" (display) vs "howling fjord"
+    - "zuljin" vs "Zul'jin" vs "zul'jin"
+
+    Returns a set of possible normalized forms to try.
+    """
+    realm_str = str(realm) if realm else ""
+    realm_str = unicodedata.normalize("NFKC", realm_str.strip())
+
+    candidates = set()
+    # Original lowercase
+    low = realm_str.lower()
+    candidates.add(low)
+    # Slug: replace spaces, apostrophes, special chars with hyphens
+    slug = re.sub(r"[\s'_.]+", "-", low)
+    candidates.add(slug)
+    # Collapse multiple hyphens
+    slug_clean = re.sub(r"-+", "-", slug)
+    candidates.add(slug_clean)
+    # Strip hyphens from edges
+    slug_stripped = slug_clean.strip("-")
+    candidates.add(slug_stripped)
+    # Remove all special chars (just alphanumeric)
+    alnum = re.sub(r"[^a-z0-9]", "", low)
+    candidates.add(alnum)
+    # Also try with realm that might have region prefix stripped
+    return candidates
+
+
 def match_layer3(
     rio_roster: list[dict],
     wcl_actors: list[dict],
@@ -310,6 +359,10 @@ def match_layer3(
     Checks if at least `min_overlap` players from the Raider.IO roster
     appear in the WCL master data (by character name + realm).
 
+    Uses flexible realm matching: slug, display name, alphanumeric-only
+    forms are all tried to handle format differences between Raider.IO
+    and WarcraftLogs.
+
     Args:
         rio_roster: List of Raider.IO roster dicts with 'name' and 'realm'.
         wcl_actors: List of WCL actor dicts with 'name' and 'server'.
@@ -318,24 +371,46 @@ def match_layer3(
     Returns:
         Tuple of (is_match, overlap_count).
     """
-    # Build set of normalized (name_lower, realm_lower) from WCL
-    wcl_names = set()
+    # Build lookup: normalized name → set of normalized realms from WCL
+    # Multiple WCL actors may share the same name (healers, tanks, etc.)
+    wcl_lookup: dict[str, set[str]] = {}
     for actor in wcl_actors:
-        name = (actor.get("name") or "").lower()
-        server = (actor.get("server") or "").lower().replace(" ", "-")
-        if name:
-            wcl_names.add((name, server))
+        if actor.get("type") == "NPC":
+            continue
+        name = _normalize_name(actor.get("name") or "")
+        server = _normalize_realm(actor.get("server") or "")
+        if name and server:
+            if name not in wcl_lookup:
+                wcl_lookup[name] = set()
+            wcl_lookup[name].update(server)
+
+    # Also build a set without realm (name-only) for fallback
+    wcl_names_only = {n for n, s in wcl_lookup.items() if s}
 
     # Check overlap with Raider.IO roster
     overlap = 0
     for player in rio_roster:
-        name = (player.get("name") or "").lower()
-        realm = player.get("realm", "")
-        if isinstance(realm, dict):
-            realm = realm.get("slug", "")
-        realm = (realm or "").lower().replace(" ", "-")
-        if name and (name, realm) in wcl_names:
-            overlap += 1
+        rio_name = _normalize_name(player.get("name") or "")
+        rio_realm_raw = player.get("realm", "")
+        if isinstance(rio_realm_raw, dict):
+            rio_realm_raw = rio_realm_raw.get("slug", str(rio_realm_raw))
+        rio_realms = _normalize_realm(rio_realm_raw)
+
+        if not rio_name:
+            continue
+
+        # Check if player name exists in WCL lookup
+        wcl_server_set = wcl_lookup.get(rio_name)
+
+        if wcl_server_set:
+            # Check realm overlap: any WCL realm candidate matches any RIO realm candidate
+            realm_match = bool(rio_realms & wcl_server_set)
+            if realm_match:
+                overlap += 1
+            elif rio_name in wcl_names_only:
+                # Name matches, but realm doesn't — still count as partial match
+                # This handles cases where WCL doesn't store realm for a character
+                overlap += 1
 
     return overlap >= min_overlap, overlap
 
@@ -471,6 +546,13 @@ def run_fuzzy_join(
             report_start_time = report.get("startTime", 0)
             fights = report.get("fights", [])
 
+            # Skip non-M+ reports by zone
+            # Zone 45 = Mythic+ Season 3 (TWW), Zone 47 = Mythic+ Season 1
+            report_zone = report.get("zone", {})
+            zone_id = report_zone.get("id") if isinstance(report_zone, dict) else report_zone
+            if zone_id not in (45, 47):
+                continue
+
             if not fights:
                 # Fetch fights separately if not included
                 try:
@@ -486,6 +568,7 @@ def run_fuzzy_join(
             ]
 
             if not mp_fights:
+                logger.debug("No M+ fights in report %s (zone=%s)", report_code, zone_id)
                 continue
 
             # Try to match each run that this tank participated in
@@ -518,7 +601,12 @@ def run_fuzzy_join(
                     )
 
                     # Layer 3: roster overlap
-                    rio_roster = rio_run.get("roster", []) or []
+                    # Convert Spark Rows to plain dicts if needed
+                    rio_roster_raw = rio_run.get("roster", []) or []
+                    rio_roster = [
+                        r.asDict() if hasattr(r, "asDict") else r
+                        for r in rio_roster_raw
+                    ]
                     l3_match, overlap_count = match_layer3(rio_roster, wcl_actors)
 
                     # Compute confidence
