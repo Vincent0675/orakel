@@ -8,13 +8,19 @@ This script implements the 3-layer fuzzy join algorithm:
 
 With stratified tank sampling to prevent ML bias toward overrepresented classes.
 
+Supports incremental checkpointing: after each tank is processed, a checkpoint
+is written to MinIO. On re-run with --resume (default), already-checkpointed
+tanks are skipped. Use --no-resume to start fresh.
+
 Usage:
     uv run python scripts/match_reports.py --season season-tww-3
     uv run python scripts/match_reports.py --season season-tww-3 --limit-tanks 10
     uv run python scripts/match_reports.py --season season-tww-3 --min-confidence 0.5
+    uv run python scripts/match_reports.py --season season-tww-3 --no-resume
 
 Output:
-    Writes match manifest Parquet to silver/matches/ on MinIO.
+    Writes match manifest Parquet to silver/matches/ on MinIO (append mode).
+    Writes checkpoint Parquet to silver/matches/checkpoints/ on MinIO.
 """
 
 from __future__ import annotations
@@ -60,6 +66,22 @@ MATCH_MANIFEST_SCHEMA = StructType(
         StructField("matched_at", TimestampType(), nullable=False),
     ]
 )
+
+# Checkpoint schema for incremental processing tracking
+CHECKPOINT_SCHEMA = StructType(
+    [
+        StructField("tank_name", StringType(), nullable=False),
+        StructField("tank_realm", StringType(), nullable=False),
+        StructField("tank_region", StringType(), nullable=False),
+        StructField("tank_class", StringType(), nullable=False),
+        StructField("processed_at", TimestampType(), nullable=False),
+        StructField("matches_found", IntegerType(), nullable=False),
+    ]
+)
+
+CHECKPOINT_PATH = "silver/match_checkpoints"
+FLUSH_INTERVAL_TANKS = 5
+FLUSH_THRESHOLD_MATCHES = 500
 
 # Tank class names for stratified sampling
 TANK_SPECS = {
@@ -462,28 +484,105 @@ def compute_confidence(
     return round(min(score, 1.0), 4)
 
 
+def _tank_key(tank: dict) -> tuple[str, str, str]:
+    """Create a hashable key for a tank from name, realm, region."""
+    realm = tank.get("realm", "")
+    if isinstance(realm, dict):
+        realm = realm.get("slug", str(realm))
+    return (tank.get("name", ""), realm, tank.get("region", ""))
+
+
+def load_checkpoints(spark: SparkSession) -> set[tuple[str, str, str]]:
+    """Load existing checkpoint data from MinIO.
+
+    Returns:
+        Set of (name, realm, region) tuples for already-processed tanks.
+    """
+    path = f"s3a://{settings.MINIO_BUCKET}/{CHECKPOINT_PATH}"
+    try:
+        df = spark.read.parquet(path)
+        rows = df.select("tank_name", "tank_realm", "tank_region").collect()
+        checkpoints = {(row["tank_name"], row["tank_realm"], row["tank_region"]) for row in rows}
+        logger.info("Loaded %d existing checkpoints", len(checkpoints))
+        return checkpoints
+    except Exception:
+        logger.info("No existing checkpoints found — starting fresh")
+        return set()
+
+
+def write_checkpoint(
+    spark: SparkSession,
+    tank: dict,
+    matches_found: int,
+) -> None:
+    """Write a checkpoint entry for a processed tank to MinIO."""
+    realm = tank.get("realm", "")
+    if isinstance(realm, dict):
+        realm = realm.get("slug", str(realm))
+
+    checkpoint_data = [{
+        "tank_name": tank.get("name", ""),
+        "tank_realm": realm,
+        "tank_region": tank.get("region", ""),
+        "tank_class": tank.get("class", ""),
+        "processed_at": datetime.now(timezone.utc),
+        "matches_found": matches_found,
+    }]
+
+    df = spark.createDataFrame(checkpoint_data, schema=CHECKPOINT_SCHEMA)
+    path = f"s3a://{settings.MINIO_BUCKET}/{CHECKPOINT_PATH}"
+    df.write.mode("append").parquet(path)
+    logger.info(
+        "Checkpoint written for %s-%s-%s (%d matches)",
+        tank.get("name", ""), realm, tank.get("region", ""), matches_found,
+    )
+
+
+def flush_matches(
+    spark: SparkSession,
+    matches: list[dict],
+    season: str,
+) -> None:
+    """Flush accumulated matches to MinIO in append mode."""
+    if not matches:
+        return
+
+    df = spark.createDataFrame(matches, schema=MATCH_MANIFEST_SCHEMA)
+    df = df.withColumn("season", F.lit(season))
+
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/matches"
+    row_count = df.count()
+    df.write.mode("append").partitionBy("season").parquet(path)
+    logger.info("Flushed %d match records to %s", row_count, path)
+
+
 def run_fuzzy_join(
     spark: SparkSession,
     season: str,
     limit_tanks: int | None = None,
     min_confidence: float = 0.5,
+    resume: bool = True,
+    dry_run: bool = False,
 ) -> list[dict]:
     """Main fuzzy join algorithm: match Raider.IO runs to WCL fights.
 
     1. Load Raider.IO runs from Silver.
     2. Extract unique tanks and stratified-sample by class.
-    3. For each sampled tank, query WCL for recent reports.
-    4. For each report, check fights for M+ matches using 3-layer algorithm.
-    5. Write match manifest to MinIO.
+    3. Skip already-checkpointed tanks if resuming.
+    4. For each sampled tank, query WCL for recent reports.
+    5. For each report, check fights for M+ matches using 3-layer algorithm.
+    6. Write checkpoint after each tank; flush matches incrementally.
 
     Args:
         spark: Active SparkSession.
         season: Season filter.
-        limit_tanks: Maximum tanks to query (None = no limit).
+        limit_tanks: Maximum NEW tanks to query (None = no limit).
         min_confidence: Minimum confidence score to include in manifest.
+        resume: If True, skip already-checkpointed tanks.
+        dry_run: If True, don't write to MinIO.
 
     Returns:
-        List of match dicts suitable for Parquet write.
+        List of match dicts for summary.
     """
     # 1. Load Silver Raider.IO data
     runs_df = load_raiderio_runs(spark, season)
@@ -494,14 +593,48 @@ def run_fuzzy_join(
         logger.warning("No tanks found in Silver data. Check roster data.")
         return []
 
-    sampled_tanks = stratified_sample_tanks(tanks, limit=limit_tanks)
+    # 2a. Load checkpoints and filter already-processed tanks
+    checkpoints: set[tuple[str, str, str]] = set()
+    if resume:
+        checkpoints = load_checkpoints(spark)
+
+    # Sample enough tanks — when resuming, oversample to compensate for
+    # already-processed ones so --limit-tanks counts NEW tanks only
+    sample_limit = None
+    if limit_tanks is not None:
+        if resume and checkpoints:
+            sample_limit = limit_tanks * 5
+        else:
+            sample_limit = limit_tanks
+
+    sampled_tanks = stratified_sample_tanks(tanks, limit=sample_limit)
     logger.info("Sampled %d tanks for WCL queries", len(sampled_tanks))
 
-    # Collect run data for matching
+    if checkpoints:
+        original_count = len(sampled_tanks)
+        sampled_tanks = [
+            t for t in sampled_tanks
+            if _tank_key(t) not in checkpoints
+        ]
+        logger.info(
+            "Skipped %d already-checkpointed tanks, %d remaining",
+            original_count - len(sampled_tanks),
+            len(sampled_tanks),
+        )
+
+    # Apply limit_tanks to remaining NEW tanks
+    if limit_tanks is not None:
+        sampled_tanks = sampled_tanks[:limit_tanks]
+
+    if not sampled_tanks:
+        logger.warning("No new tanks to process after checkpoint filtering.")
+        return []
+
+    # 3. Collect run data for matching
     runs_data = runs_df.collect()
     runs_by_id = {row["keystone_run_id"]: row.asDict() for row in runs_data}
 
-    # 3. Create WCL client
+    # 4. Create WCL client
     try:
         wcl_client = WarcraftLogsClient()
     except WCLAuthError as e:
@@ -513,10 +646,13 @@ def run_fuzzy_join(
         return []
 
     matches: list[dict] = []
+    last_flush_idx = 0
+    tanks_since_flush = 0
     tanks_processed = 0
 
     for tank in sampled_tanks:
         tanks_processed += 1
+        tanks_since_flush += 1
         tank_name = tank["name"]
         tank_realm = tank["realm"]
         tank_region = tank["region"]
@@ -541,7 +677,12 @@ def run_fuzzy_join(
             )
         except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
             logger.warning("Failed to fetch reports for tank %s (%s): %s", tank_name, type(e).__name__, e)
+            # Still write checkpoint even on fetch failure
+            if not dry_run:
+                write_checkpoint(spark, tank, 0)
             continue
+
+        tank_match_count = 0
 
         for report in reports:
             report_code = report.get("code", "")
@@ -641,14 +782,37 @@ def run_fuzzy_join(
                         "match_method": method,
                         "matched_at": datetime.now(timezone.utc),
                     })
+                    tank_match_count += 1
+
+        # Write checkpoint for this tank
+        if not dry_run:
+            write_checkpoint(spark, tank, tank_match_count)
 
         # Rate limit awareness between tanks
         logger.info(
-            "Tank %s done. WCL points remaining: %d, total spent: %d",
+            "Tank %s done. WCL points remaining: %d, total spent: %d, tank matches: %d",
             tank_name,
             wcl_client.rate_limiter.points_remaining,
             wcl_client.rate_limiter.total_spent,
+            tank_match_count,
         )
+
+        # Incremental flush: every FLUSH_INTERVAL_TANKS tanks or when
+        # accumulated matches since last flush exceed FLUSH_THRESHOLD_MATCHES
+        should_flush = (
+            tanks_since_flush >= FLUSH_INTERVAL_TANKS
+            or len(matches) - last_flush_idx >= FLUSH_THRESHOLD_MATCHES
+        )
+        if not dry_run and should_flush:
+            batch = matches[last_flush_idx:]
+            flush_matches(spark, batch, season)
+            last_flush_idx = len(matches)
+            tanks_since_flush = 0
+
+    # Final flush for remaining matches
+    if not dry_run and last_flush_idx < len(matches):
+        batch = matches[last_flush_idx:]
+        flush_matches(spark, batch, season)
 
     logger.info("Total matches found: %d", len(matches))
     return matches
@@ -675,8 +839,8 @@ def write_match_manifest(spark: SparkSession, matches: list[dict], season: str) 
     row_count = df.count()
     logger.info("Writing %d match records to %s", row_count, path)
 
-    df.write.mode("overwrite").partitionBy("season").parquet(path)
-    logger.info("Match manifest written: %d rows to %s", row_count, path)
+    df.write.mode("append").partitionBy("season").parquet(path)
+    logger.info("Match manifest written: %d rows to %s (append mode)", row_count, path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -692,7 +856,7 @@ def parse_args() -> argparse.Namespace:
         "--limit-tanks",
         type=int,
         default=None,
-        help="Maximum number of tanks to query WCL for (default: all)",
+        help="Maximum number of NEW tanks to query WCL for (default: all, excludes already-checkpointed)",
     )
     parser.add_argument(
         "--min-confidence",
@@ -705,6 +869,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run matching without writing to MinIO",
     )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip already-checkpointed tanks (default: --resume, use --no-resume to start fresh)",
+    )
     return parser.parse_args()
 
 
@@ -712,10 +882,11 @@ def main() -> None:
     args = parse_args()
 
     logger.info(
-        "Starting fuzzy join: season=%s, limit_tanks=%s, min_confidence=%.2f",
+        "Starting fuzzy join: season=%s, limit_tanks=%s, min_confidence=%.2f, resume=%s",
         args.season,
         args.limit_tanks,
         args.min_confidence,
+        args.resume,
     )
 
     # Check WCL credentials
@@ -737,14 +908,16 @@ def main() -> None:
             season=args.season,
             limit_tanks=args.limit_tanks,
             min_confidence=args.min_confidence,
+            resume=args.resume,
+            dry_run=args.dry_run,
         )
 
         if not matches:
             logger.warning("No matches found. Check WCL credentials and Silver data.")
             sys.exit(1)
 
-        if not args.dry_run:
-            write_match_manifest(spark, matches, args.season)
+        # Matches are written incrementally by run_fuzzy_join (unless dry-run).
+        # For dry-run, we just report what would have been written.
 
         # Summary
         logger.info("=" * 60)

@@ -13,6 +13,10 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = [
+    "plotly>=6.8.0",
+    "streamlit>=1.58.0",
+]
 test = ["pytest>=8", "pytest-cov>=6", "responses>=0.25", "chispa>=0.12"]
 
 [tool.pytest.ini_options]

@@ -22,10 +22,24 @@ import requests
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
+from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField, StructType, TimestampType
+
 from orakel.clients.warcraftlogs import WCLAuthError, WCLRateLimitError, WarcraftLogsClient
 from orakel.config import settings
 from orakel.models.schemas import bronze_wcl_events_schema, bronze_wcl_reports_schema
 from orakel.utils.minio import get_spark_session
+
+# ─── Checkpoint Schema ─────────────────────────────────────────────────────────
+
+CHECKPOINT_SCHEMA = StructType([
+    StructField("report_code", StringType(), nullable=False),
+    StructField("damage_taken_done", BooleanType(), nullable=False),
+    StructField("healing_done", BooleanType(), nullable=False),
+    StructField("interrupts_done", BooleanType(), nullable=False),
+    StructField("fight_count", IntegerType(), nullable=False),
+    StructField("events_count", IntegerType(), nullable=False),
+    StructField("processed_at", TimestampType(), nullable=False),
+])
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +234,41 @@ def ingest_interrupts(
     return events
 
 
+def write_checkpoint(
+    spark: SparkSession,
+    report_code: str,
+    damage_taken_done: bool,
+    healing_done: bool,
+    interrupts_done: bool,
+    fight_count: int,
+    events_count: int,
+) -> None:
+    """Write a single checkpoint entry for a processed report.
+
+    Args:
+        spark: Active SparkSession.
+        report_code: WCL report code.
+        damage_taken_done: Whether DamageTaken was fetched.
+        healing_done: Whether Healing was fetched.
+        interrupts_done: Whether Interrupts was fetched.
+        fight_count: Number of fights in the report.
+        events_count: Total events fetched for this report.
+    """
+    row = [{
+        "report_code": report_code,
+        "damage_taken_done": damage_taken_done,
+        "healing_done": healing_done,
+        "interrupts_done": interrupts_done,
+        "fight_count": fight_count,
+        "events_count": events_count,
+        "processed_at": datetime.now(timezone.utc),
+    }]
+    df = spark.createDataFrame(row, schema=CHECKPOINT_SCHEMA)
+    path = f"s3a://{settings.MINIO_BUCKET}/bronze/warcraftlogs/checkpoints"
+    logger.info("Writing checkpoint for report %s (%d events, %d fights)", report_code, events_count, fight_count)
+    df.write.mode("append").parquet(path)
+
+
 def write_bronze_events(spark: SparkSession, events: list[dict], event_type: str) -> None:
     """Write Bronze events to MinIO Parquet.
 
@@ -304,7 +353,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Maximum number of matches to process",
+        help="Maximum number of NEW reports to process (after skipping checkpointed ones)",
     )
     parser.add_argument(
         "--skip-damage",
@@ -320,6 +369,18 @@ def parse_args() -> argparse.Namespace:
         "--skip-interrupts",
         action="store_true",
         help="Skip Interrupt events fetch (saves WCL points)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Resume from checkpoints — skip already-processed reports (default)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_false",
+        dest="resume",
+        help="Start fresh — ignore existing checkpoints",
     )
     return parser.parse_args()
 
@@ -350,12 +411,21 @@ def main() -> None:
             logger.error("No match manifest found. Run match_reports.py first.")
             sys.exit(1)
 
-        if args.limit:
-            matches = matches[:args.limit]
-            logger.info("Limited to %d matches", args.limit)
-
-        # Create WCL client
-        wcl_client = WarcraftLogsClient()
+        # ── Resume: load checkpoints and skip already-processed reports ──────────
+        checkpoint_data: dict[str, dict] = {}  # report_code -> checkpoint row dict
+        if args.resume:
+            path = f"s3a://{settings.MINIO_BUCKET}/bronze/warcraftlogs/checkpoints"
+            try:
+                cp_df = spark.read.parquet(path)
+                for row in cp_df.collect():
+                    r = row.asDict()
+                    code = r["report_code"]
+                    # Keep the LATEST checkpoint per report_code (most recent processed_at)
+                    if code not in checkpoint_data or r.get("processed_at", 0) > checkpoint_data[code].get("processed_at", 0):
+                        checkpoint_data[code] = r
+                logger.info("Loaded %d existing checkpoints", len(checkpoint_data))
+            except Exception:
+                logger.info("No existing checkpoints found — starting fresh")
 
         # Group matches by report_code for efficient API usage
         from collections import defaultdict
@@ -363,18 +433,55 @@ def main() -> None:
         for m in matches:
             by_report[m["wcl_report_code"]].append(m)
 
-        all_damage_events: list[dict] = []
-        all_healing_events: list[dict] = []
-        all_interrupt_events: list[dict] = []
-        all_reports: list[dict] = []
+        # ── Filter out already-processed reports ────────────────────────────────
+        remaining_reports: dict[str, list[dict]] = {}
+        for report_code, report_matches in by_report.items():
+            cp = checkpoint_data.get(report_code)
+            if cp is not None:
+                # A report is complete when all non-skipped event types are done
+                needed_damage = not args.skip_damage
+                needed_healing = not args.skip_healing
+                needed_interrupts = not args.skip_interrupts
 
-        total_reports = len(by_report)
-        for i, (report_code, report_matches) in enumerate(by_report.items(), 1):
+                damage_ok = (not needed_damage) or cp.get("damage_taken_done", False)
+                healing_ok = (not needed_healing) or cp.get("healing_done", False)
+                interrupts_ok = (not needed_interrupts) or cp.get("interrupts_done", False)
+
+                if damage_ok and healing_ok and interrupts_ok:
+                    logger.info("Skipping %s — already checkpointed", report_code)
+                    continue
+
+            remaining_reports[report_code] = report_matches
+
+        logger.info(
+            "Reports: %d total, %d already checkpointed, %d remaining",
+            len(by_report), len(by_report) - len(remaining_reports), len(remaining_reports),
+        )
+
+        # ── Apply --limit to NEW (remaining) reports ───────────────────────────
+        if args.limit:
+            # --limit N means process up to N NEW reports after skipping
+            remaining_items = list(remaining_reports.items())
+            remaining_reports = dict(remaining_items[:args.limit])
+            logger.info("Limited to %d new reports", args.limit)
+
+        if not remaining_reports:
+            logger.info("No new reports to process. Exiting.")
+            sys.exit(0)
+
+        # Create WCL client
+        wcl_client = WarcraftLogsClient()
+
+        total_reports = len(remaining_reports)
+        for i, (report_code, report_matches) in enumerate(remaining_reports.items(), 1):
             fight_ids = [m["wcl_fight_id"] for m in report_matches]
             logger.info(
                 "Processing report %d/%d: %s (%d fights)",
                 i, total_reports, report_code, len(fight_ids),
             )
+
+            # Track per-report event counts
+            report_event_count = 0
 
             # Fetch masterData for actor_id → player_name resolution
             actor_map: dict[int, str] = {}
@@ -389,22 +496,33 @@ def main() -> None:
             except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
                 logger.warning("Failed to fetch masterData for %s (%s): %s", report_code, type(e).__name__, e)
 
+            # Track which event types were done for this report
+            damage_done = False
+            healing_done = False
+            interrupts_done = False
+
             # Fetch DamageTaken events
             if not args.skip_damage:
                 damage_events = ingest_damage_taken(wcl_client, report_code, fight_ids)
-                all_damage_events.extend(damage_events)
+                write_bronze_events(spark, damage_events, "damage_taken")
+                report_event_count += len(damage_events)
+                damage_done = True
                 logger.info("  DamageTaken: %d events", len(damage_events))
 
             # Fetch Healing events (+ resolve target_name via masterData)
             if not args.skip_healing:
                 healing_events = ingest_healing(wcl_client, report_code, fight_ids, actor_map)
-                all_healing_events.extend(healing_events)
+                write_bronze_events(spark, healing_events, "healing")
+                report_event_count += len(healing_events)
+                healing_done = True
                 logger.info("  Healing: %d events", len(healing_events))
 
             # Fetch Interrupt events + resolve player_name via masterData
             if not args.skip_interrupts:
                 interrupt_events = ingest_interrupts(wcl_client, report_code, fight_ids, actor_map)
-                all_interrupt_events.extend(interrupt_events)
+                write_bronze_events(spark, interrupt_events, "interrupts")
+                report_event_count += len(interrupt_events)
+                interrupts_done = True
                 logger.info("  Interrupts: %d events", len(interrupt_events))
 
             # Log point usage
@@ -414,25 +532,21 @@ def main() -> None:
                 wcl_client.rate_limiter.total_spent,
             )
 
-        # Write all Bronze events
-        if not args.skip_damage:
-            write_bronze_events(spark, all_damage_events, "damage_taken")
-
-        if not args.skip_healing:
-            write_bronze_events(spark, all_healing_events, "healing")
-
-        if not args.skip_interrupts:
-            write_bronze_events(spark, all_interrupt_events, "interrupts")
+            # ── Write checkpoint per report ─────────────────────────────────────
+            write_checkpoint(
+                spark,
+                report_code=report_code,
+                damage_taken_done=damage_done,
+                healing_done=healing_done,
+                interrupts_done=interrupts_done,
+                fight_count=len(fight_ids),
+                events_count=report_event_count,
+            )
 
         # Summary
         logger.info("=" * 60)
         logger.info("WCL events ingestion complete. Summary:")
-        if not args.skip_damage:
-            logger.info("  DamageTaken: %d events", len(all_damage_events))
-        if not args.skip_healing:
-            logger.info("  Healing: %d events", len(all_healing_events))
-        if not args.skip_interrupts:
-            logger.info("  Interrupts: %d events", len(all_interrupt_events))
+        logger.info("  Reports processed this run: %d", total_reports)
         logger.info("  Total WCL points spent: %d", wcl_client.rate_limiter.total_spent)
         logger.info("=" * 60)
 
