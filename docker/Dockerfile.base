@@ -1,0 +1,94 @@
+# Orakel — base image
+#
+# Shared image for all services (Dagster, MLflow, Streamlit, scripts).
+# Contains:
+#   - Python 3.13
+#   - Java 17 (for PySpark)
+#   - Apache Spark 4.1.2 (installed via pip, not Hadoop)
+#   - Project dependencies via uv
+#   - PySpark S3A JARs (hadoop-aws + AWS SDK v2)
+#
+# Build:
+#   docker build -f docker/Dockerfile.base -t orakel-base:latest .
+# or
+#   docker compose build base  (the docker-compose.yml references this)
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder — install Python deps with uv
+# ---------------------------------------------------------------------------
+FROM python:3.13-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Copy dependency manifests first (Docker layer caching)
+COPY pyproject.toml uv.lock ./
+
+# Install deps into the system Python (we want all services to share the image)
+RUN uv pip install --system --no-cache .
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime — minimal image with everything pre-installed
+# ---------------------------------------------------------------------------
+FROM python:3.13-slim AS runtime
+
+# Java 17 (required for PySpark 4.x with the new Spark Connect architecture)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set JAVA_HOME for PySpark
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# Spark env vars
+ENV SPARK_HOME=/usr/local/lib/python3.13/site-packages/pyspark
+ENV PYSPARK_SUBMIT_ARGS="--driver-memory 4g pyspark-shell"
+ENV PYTHONPATH=/app
+
+WORKDIR /app
+
+# Copy installed Python packages from builder
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy project source
+COPY orakel/ ./orakel/
+COPY dashboard/ ./dashboard/
+COPY scripts/ ./scripts/
+COPY tests/ ./tests/
+COPY pyproject.toml uv.lock ./
+
+# Download S3A JARs (hadoop-aws + AWS SDK v2 bundle)
+# These are required for PySpark to read/write to MinIO via S3A
+ARG HADOOP_AWS_VERSION=3.4.2
+ARG AWS_SDK_V2_VERSION=2.29.51
+RUN mkdir -p /app/jars && \
+    curl -sL -o /app/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar \
+        "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    curl -sL -o /app/jars/bundle-${AWS_SDK_V2_VERSION}.jar \
+        "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/${AWS_SDK_V2_VERSION}/bundle-${AWS_SDK_V2_VERSION}.jar" && \
+    ls -lh /app/jars/
+
+# Health check script (used by all services)
+COPY docker/healthcheck.sh /usr/local/bin/orakel-healthcheck
+RUN chmod +x /usr/local/bin/orakel-healthcheck
+
+# Default working directory
+WORKDIR /app
+
+# Health check default: returns 0 if Spark is installed
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import pyspark; import orakel; print('healthy')"]
+
+CMD ["bash"]

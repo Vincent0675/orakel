@@ -1,10 +1,30 @@
+# Orakel — full Docker Compose stack
+#
+# Services:
+#   - minio:           S3-compatible storage
+#   - mlflow:          MLflow tracking server (SQLite backend)
+#   - dagster-webserver: Dagster UI (port 3000)
+#   - dagster-daemon:  Schedule/sensor executor
+#   - dashboard:       Streamlit BI dashboard (port 8501)
+#
+# Quick start:
+#   docker compose up --build          # Build images + start all services
+#   docker compose up -d               # Start in background
+#   docker compose down                # Stop everything
+#   docker compose logs -f dashboard   # Follow logs of a specific service
+#
+# Environment variables are loaded from .env (see .env.example)
+
 services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Storage: MinIO (S3-compatible)
+  # ──────────────────────────────────────────────────────────────────────────
   minio:
     image: minio/minio:latest
     container_name: orakel-minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
     environment:
       MINIO_ROOT_USER: orakel
       MINIO_ROOT_PASSWORD: orakel123
@@ -16,3 +36,140 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # MLflow tracking server (SQLite backend, file artifact store on shared vol)
+  # ──────────────────────────────────────────────────────────────────────────
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.base
+    container_name: orakel-mlflow
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MLFLOW_TRACKING_URI: sqlite:////app/mlflow/mlflow.db
+      AWS_ACCESS_KEY_ID: orakel
+      AWS_SECRET_ACCESS_KEY: orakel123
+    volumes:
+      - ./mlflow:/app/mlflow        # SQLite + artifacts persistidos
+    command: >
+      bash -c "
+        mkdir -p /app/mlflow &&
+        mlflow server
+          --backend-store-uri sqlite:////app/mlflow/mlflow.db
+          --default-artifact-root /app/mlflow/artifacts
+          --host 0.0.0.0
+          --port 5000
+      "
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Dagster: webserver (UI) and daemon (schedules)
+  # ──────────────────────────────────────────────────────────────────────────
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dagster
+    container_name: orakel-dagster-webserver
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      DAGSTER_HOME: /app/dagster_home
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: orakel
+      MINIO_SECRET_KEY: orakel123
+      MINIO_BUCKET: orakel
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      WCL_CLIENT_ID: ${WCL_CLIENT_ID:-}
+      WCL_CLIENT_SECRET: ${WCL_CLIENT_SECRET:-}
+      RAIDERIO_API_KEY: ${RAIDERIO_API_KEY:-}
+      SEASON: ${SEASON:-season-tww-3}
+    volumes:
+      - ./dagster_home:/app/dagster_home
+      - ./mlflow:/app/mlflow  # Shared access to mlflow artifacts
+      - ./data:/app/data      # Local fallback for any file-based outputs
+    ports:
+      - "3000:3000"
+    command: >
+      bash -c "
+        dagster dev
+          -m orakel.pipeline.definitions
+          -h 0.0.0.0
+          -p 3000
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/server_info"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dagster
+    container_name: orakel-dagster-daemon
+    depends_on:
+      minio:
+        condition: service_healthy
+      dagster-webserver:
+        condition: service_started
+    environment:
+      DAGSTER_HOME: /app/dagster_home
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: orakel
+      MINIO_SECRET_KEY: orakel123
+      MINIO_BUCKET: orakel
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      WCL_CLIENT_ID: ${WCL_CLIENT_ID:-}
+      WCL_CLIENT_SECRET: ${WCL_CLIENT_SECRET:-}
+      RAIDERIO_API_KEY: ${RAIDERIO_API_KEY:-}
+      SEASON: ${SEASON:-season-tww-3}
+    volumes:
+      - ./dagster_home:/app/dagster_home
+      - ./mlflow:/app/mlflow
+      - ./data:/app/data
+    command: dagster daemon run
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Streamlit BI dashboard
+  # ──────────────────────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: orakel-dashboard
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: orakel
+      MINIO_SECRET_KEY: orakel123
+      MINIO_BUCKET: orakel
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      SEASON: ${SEASON:-season-tww-3}
+    volumes:
+      - ./mlflow:/app/mlflow  # For shared access if needed
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Default network: all services on the same bridge
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  default:
+    name: orakel-net

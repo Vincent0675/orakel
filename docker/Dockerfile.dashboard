@@ -1,0 +1,25 @@
+# Orakel — Streamlit dashboard service image
+#
+# Builds on orakel-base and runs the BI dashboard.
+#
+# Build:
+#   docker build -f docker/Dockerfile.dashboard -t orakel-dashboard:latest .
+
+FROM orakel-base:latest
+
+# Streamlit config — listen on all interfaces, suppress telemetry
+ENV STREAMLIT_SERVER_PORT=8501
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+ENV STREAMLIT_THEME_BASE=light
+
+EXPOSE 8501
+
+# Health check: verify the dashboard responds on its port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl --fail --silent http://localhost:8501/_stcore/health || exit 1
+
+CMD ["streamlit", "run", "dashboard/app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true"]

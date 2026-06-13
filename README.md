@@ -146,31 +146,78 @@ orakel/ml/
 
 ## 🚀 Quick Start
 
-### Requisitos
+### Opción A — Modo local (proceso host + MinIO en Docker)
+
+Ideal para **desarrollo iterativo** con hot-reload.
+
+#### Requisitos
 - Python 3.13+
 - [uv](https://docs.astral.sh/uv/) (gestor de dependencias)
 - Docker + Docker Compose (para MinIO)
 
-### 1. Setup
+#### 1. Setup
 ```bash
 make setup       # Crea .env desde .env.example, instala deps
 ```
 
-### 2. Levantar servicios (MinIO, MLflow, Dagster)
+#### 2. Levantar servicios (MinIO en Docker, el resto en el host)
 ```bash
 make run
 ```
 
 Esto inicia en background:
-- **MinIO** (S3-compatible storage) → `localhost:9000` (API), `localhost:9001` (console, `orakel` / `orakel123`)
-- **MLflow** tracking server → `localhost:5000`
-- **Dagster** webserver → `localhost:3000`
+- **MinIO** (Docker) → `localhost:9000` (API), `localhost:9001` (console, `orakel` / `orakel123`)
+- **MLflow** (proceso host) → `localhost:5000`
+- **Dagster** (proceso host) → `localhost:3000`
 
-### 3. Ver logs / detener
+#### 3. Ver logs / detener
 ```bash
 make logs        # Ver logs de los servicios
 make stop        # Detener todos los servicios
 ```
+
+---
+
+### Opción B — Todo en Docker (un solo comando)
+
+Ideal para **despliegue reproducible**, demos, y entornos limpios. Toda la aplicación corre en contenedores — solo necesitás Docker.
+
+#### Requisitos
+- Docker + Docker Compose v2
+
+#### Un solo comando
+```bash
+make docker-up
+```
+
+Esto **construye las imágenes** y levanta **toda la stack** en background:
+
+| Servicio | Puerto | URL |
+|----------|:------:|-----|
+| **MinIO** | 9000 / 9001 | API / Console (`orakel` / `orakel123`) |
+| **MLflow** | 5000 | http://localhost:5000 |
+| **Dagster webserver** | 3000 | http://localhost:3000 |
+| **Dagster daemon** | — | (sin puerto — ejecuta schedules) |
+| **Streamlit dashboard** | 8501 | http://localhost:8501 |
+
+#### Otros comandos Docker
+```bash
+make docker-build   # Solo construir las imágenes
+make docker-ps      # Ver contenedores corriendo
+make docker-logs    # Ver logs en vivo
+make docker-down    # Detener todo (preserva datos)
+```
+
+#### Estructura Docker
+```
+docker/
+├── Dockerfile.base         # Python 3.13 + Spark 4 + Java 17 + JARs S3A
+├── Dockerfile.dagster      # Dagster webserver + daemon
+├── Dockerfile.dashboard    # Streamlit BI dashboard
+└── healthcheck.sh          # Health check compartido
+```
+
+Las imágenes usan un **multi-stage build**: un stage de builder instala dependencias con `uv`, un stage de runtime mínimo solo incluye lo necesario para ejecutar. La imagen final pesa ~1.5 GB (incluye Spark + JRE + JARs S3A).
 
 ---
 

@@ -1,0 +1,22 @@
+# Orakel — Dagster service image
+#
+# Builds on orakel-base and configures Dagster webserver + daemon.
+#
+# Build:
+#   docker build -f docker/Dockerfile.dagster -t orakel-dagster:latest .
+
+FROM orakel-base:latest
+
+# Dagster needs writable home for some assets
+ENV DAGSTER_HOME=/app/dagster_home
+RUN mkdir -p $DAGSTER_HOME
+
+# Streamlit config
+ENV STREAMLIT_SERVER_PORT=8501
+ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
+
+EXPOSE 3000
+
+# Default: launch Dagster dev webserver
+# The daemon is started as a separate service in docker-compose
+CMD ["dagster", "dev", "-m", "orakel.pipeline.definitions", "-h", "0.0.0.0", "-p", "3000"]

@@ -32,7 +32,7 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup run stop logs test test-fast coverage pipeline dashboard clean
+.PHONY: help setup run stop logs test test-fast coverage pipeline dashboard clean docker-build docker-up docker-down docker-logs docker-ps
 
 # ---------------------------------------------------------------------------
 # Help
@@ -40,15 +40,22 @@ endif
 help: ## Show this help message
 	@echo "$(BOLD)Orakel — WoW Mythic+ analytics pipeline$(RESET)"
 	@echo ""
-	@echo "$(BOLD)Available targets:$(RESET)"
+	@echo "$(BOLD)Local development (no Docker):$(RESET)"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	    awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-15s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
+	@echo "$(BOLD)Docker-based deployment:$(RESET)"
+	@echo "  $(GREEN)docker-build$(RESET)    Build all Docker images"
+	@echo "  $(GREEN)docker-up$(RESET)       Start all services in Docker (background)"
+	@echo "  $(GREEN)docker-down$(RESET)     Stop all Docker services"
+	@echo "  $(GREEN)docker-logs$(RESET)     Follow logs from all Docker services"
+	@echo "  $(GREEN)docker-ps$(RESET)       Show running Docker containers"
+	@echo ""
 	@echo "$(BOLD)Examples:$(RESET)"
-	@echo "  make setup     # First time: install deps and create .env"
-	@echo "  make run       # Start MinIO, MLflow, Dagster in background"
-	@echo "  make test      # Run the full test suite"
-	@echo "  make stop      # Stop all background services"
+	@echo "  make setup        # First time: install deps and create .env"
+	@echo "  make run          # Start MinIO, MLflow, Dagster in background (host)"
+	@echo "  make test         # Run the full test suite"
+	@echo "  make docker-up    # Start everything in Docker (one command)"
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -153,3 +160,34 @@ clean-data: clean ## Stop services AND remove MinIO data + MLflow runs
 	@docker compose down -v
 	@rm -rf data/ mlruns/ mlflow.db
 	@echo "$(GREEN)✓ All data removed.$(RESET)"
+
+# ---------------------------------------------------------------------------
+# Docker targets — full stack as containers
+# ---------------------------------------------------------------------------
+docker-build: ## Build all Docker images (base, dagster, dashboard)
+	@echo "$(GREEN)▶ Building Docker images...$(RESET)"
+	@docker compose build
+	@echo "$(GREEN)✓ Images built. Run 'make docker-up' to start the stack.$(RESET)"
+
+docker-up: ## Start all services in Docker (MinIO, MLflow, Dagster, Dashboard)
+	@echo "$(GREEN)▶ Starting Orakel stack in Docker...$(RESET)"
+	@docker compose up -d --build
+	@echo ""
+	@echo "$(GREEN)✓ Stack is starting. Services:$(RESET)"
+	@echo "  $(BOLD)MinIO$(RESET)       http://localhost:9001 (orakel / orakel123)"
+	@echo "  $(BOLD)MLflow$(RESET)      http://localhost:5000"
+	@echo "  $(BOLD)Dagster$(RESET)     http://localhost:3000"
+	@echo "  $(BOLD)Dashboard$(RESET)   http://localhost:8501"
+	@echo ""
+	@echo "$(YELLOW)Tip: 'make docker-logs' to follow service output, 'make docker-down' to stop.$(RESET)"
+
+docker-down: ## Stop all Docker services (data volumes preserved)
+	@echo "$(YELLOW)▶ Stopping Docker stack...$(RESET)"
+	@docker compose down
+	@echo "$(GREEN)✓ All services stopped.$(RESET)"
+
+docker-logs: ## Follow logs from all Docker services
+	@docker compose logs -f
+
+docker-ps: ## Show running Docker containers
+	@docker compose ps
