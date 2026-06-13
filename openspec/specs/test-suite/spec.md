@@ -37,6 +37,12 @@ The `tests/` directory MUST mirror the `orakel/` package layout:
 tests/
 ├── conftest.py              # Shared fixtures (SparkSession, mock clients)
 ├── pytest.ini               # Markers, asyncio mode, test discovery
+├── test_ml/
+│   ├── __init__.py
+│   ├── test_schemas.py      # Tier 1 — schema constants
+│   ├── test_trainer.py      # Tier 1 — trainer with mocks
+│   ├── test_predict.py      # Tier 1 — prediction edge cases
+│   └── test_features.py     # Tier 2 — Spark feature engineering
 ├── test_models/
 │   ├── test_kpi.py          # Tier 1 — pytest
 │   └── test_schemas.py      # Tier 1 — schema constructors
@@ -454,6 +460,45 @@ The root `conftest.py` MUST provide:
 
 ---
 
+## Requirement 12: ML Test Directory Structure
+
+The `tests/test_ml/` directory MUST mirror the `orakel/ml/` package structure with the following layout:
+
+```
+tests/test_ml/
+├── __init__.py              # Package init
+├── test_schemas.py          # Tier 1 — schema constants and column definitions
+├── test_trainer.py          # Tier 1 — training pipeline with MLflow/MinIO mocks
+├── test_predict.py          # Tier 1 — prediction with loaded model, edge cases
+└── test_features.py         # Tier 2 — Spark feature engineering (Phase 2)
+```
+
+### Scenario: ML test files exist
+
+- GIVEN the `tests/test_ml/` directory
+- WHEN listing its contents
+- THEN `test_schemas.py`, `test_trainer.py`, `test_predict.py` SHALL exist (Phase 1)
+- AND `test_features.py` SHALL exist after Phase 2
+
+## Requirement 13: ML Coverage Targets
+
+ML module coverage SHALL meet the following targets:
+
+| Target | Metric | Phase |
+|--------|--------|-------|
+| ≥80% line coverage | `schemas.py`, `trainer.py`, `predict.py` combined | Phase 1 |
+| ≥70% line coverage | `features.py` | Phase 2 |
+| ≥14 Tier 1 tests | `test_schemas.py` + `test_trainer.py` + `test_predict.py` | Phase 1 |
+| ≥8 Tier 2 tests | `test_features.py` | Phase 2 |
+
+### Scenario: ML coverage measured after Phase 1
+
+- GIVEN all Tier 1 ML tests pass
+- WHEN running `uv run pytest tests/test_ml/ -m "not spark" --cov=orakel/ml --cov-report=term`
+- THEN combined line coverage on `schemas.py`, `trainer.py`, `predict.py` SHALL be ≥80%
+
+---
+
 ## Non-Functional Requirements
 
 1. **SparkSession config**: local[1], `spark.driver.memory=4g`, `spark.sql.session.timeZone=UTC`
@@ -461,3 +506,7 @@ The root `conftest.py` MUST provide:
 3. **Coverage target**: ≥80% on pure modules (`kpi.py`, `config.py`, `bronze.py::_run_to_row`, `rate_limiter.py`) when running Tier 1
 4. **Total test count**: ≥150 tests across both tiers
 5. **Cleanup**: SparkSession SHALL be stopped in a finalizer via `pytest` session finish hook
+6. **ML Tier 1 coverage**: ≥80% line coverage on `orakel/ml/schemas.py`, `orakel/ml/trainer.py`, `orakel/ml/predict.py` combined
+7. **ML Tier 2 coverage**: ≥70% line coverage on `orakel/ml/features.py` after Phase 2
+8. **ML test count**: ≥14 Tier 1 tests across `test_schemas.py`, `test_trainer.py`, `test_predict.py`
+9. **ML Tier 2 test count**: ≥8 tests in `test_features.py`

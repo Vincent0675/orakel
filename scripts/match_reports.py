@@ -51,9 +51,94 @@ from pyspark.sql.types import (
 
 from orakel.clients.warcraftlogs import WCLAuthError, WCLRateLimitError, WarcraftLogsClient
 from orakel.config import settings
+from orakel.models.schemas import dead_letter_schema
 from orakel.utils.minio import get_spark_session
 
 logger = logging.getLogger(__name__)
+
+# ─── Dead-Letter Queue helpers ──────────────────────────────────────────────
+
+_dlq_buffer: list[dict] = []
+
+
+def write_dead_letter(
+    spark: SparkSession,
+    entity_type: str,
+    entity_key: str,
+    error_type: str,
+    error_message: str,
+    payload_snapshot: str,
+    season: str,
+    sub_path: str,
+) -> None:
+    """Write a single record to the dead-letter queue on MinIO.
+
+    Args:
+        spark: Active SparkSession.
+        entity_type: Type of entity that failed (e.g. "wcl_matches").
+        entity_key: Identifier for the failed entity (e.g. report_code).
+        error_type: Short error category (e.g. "rate_limit", "auth_error", "timeout").
+        error_message: Full error message or traceback.
+        payload_snapshot: JSON snapshot of the input that failed (truncated to 1KB).
+        season: Season identifier for partitioning.
+        sub_path: DLQ sub-path (e.g. "wcl_matches").
+    """
+    # Truncate payload snapshot to 1KB
+    if len(payload_snapshot) > 1024:
+        payload_snapshot = payload_snapshot[:1024] + "...[truncated]"
+
+    record = {
+        "entity_type": entity_type,
+        "entity_key": entity_key,
+        "error_type": error_type,
+        "error_message": error_message[:2000] if error_message else "",
+        "payload_snapshot": payload_snapshot,
+        "occurred_at": datetime.now(timezone.utc),
+        "retried": False,
+        "season": season,
+    }
+    _dlq_buffer.append(record)
+
+    # Flush to MinIO every 50 records
+    if len(_dlq_buffer) >= 50:
+        flush_dead_letter(spark, sub_path)
+
+
+def flush_dead_letter(spark: SparkSession, sub_path: str) -> int:
+    """Flush buffered dead-letter records to MinIO Parquet.
+
+    Args:
+        spark: Active SparkSession.
+        sub_path: DLQ sub-path (e.g. "wcl_matches").
+
+    Returns:
+        Number of records flushed.
+    """
+    global _dlq_buffer
+    if not _dlq_buffer:
+        return 0
+
+    df = spark.createDataFrame(_dlq_buffer, schema=dead_letter_schema)
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/dead_letter/{sub_path}"
+    count = df.count()
+    df.write.mode("append").partitionBy("season").parquet(path)
+    logger.warning("DLQ: flushed %d records to %s", count, path)
+    flushed = len(_dlq_buffer)
+    _dlq_buffer = []
+    return flushed
+
+
+def _classify_error(error: Exception) -> str:
+    """Classify an exception into a short error type string for DLQ."""
+    if isinstance(error, WCLRateLimitError):
+        return "rate_limit"
+    if isinstance(error, WCLAuthError):
+        return "auth_error"
+    if isinstance(error, requests.Timeout):
+        return "timeout"
+    if isinstance(error, requests.HTTPError):
+        return "http_error"
+    return type(error).__name__
 
 # Match manifest schema
 MATCH_MANIFEST_SCHEMA = StructType(
@@ -676,7 +761,18 @@ def run_fuzzy_join(
                 limit=100,
             )
         except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
-            logger.warning("Failed to fetch reports for tank %s (%s): %s", tank_name, type(e).__name__, e)
+            error_type = _classify_error(e)
+            logger.warning("Failed to fetch reports for tank %s (%s): %s", tank_name, error_type, e)
+            write_dead_letter(
+                spark=spark,
+                entity_type="wcl_matches",
+                entity_key=f"{tank_name}:{tank_realm}:{tank_region}",
+                error_type=error_type,
+                error_message=str(e),
+                payload_snapshot=f'{{"character_name": "{tank_name}", "server_slug": "{tank_realm}", "region": "{tank_region}"}}',
+                season=season,
+                sub_path="wcl_matches",
+            )
             # Still write checkpoint even on fetch failure
             if not dry_run:
                 write_checkpoint(spark, tank, 0)
@@ -701,7 +797,18 @@ def run_fuzzy_join(
                 try:
                     fights = wcl_client.get_fights(report_code)
                 except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
-                    logger.warning("Failed to fetch fights for report %s (%s): %s", report_code, type(e).__name__, e)
+                    error_type = _classify_error(e)
+                    logger.warning("Failed to fetch fights for report %s (%s): %s", report_code, error_type, e)
+                    write_dead_letter(
+                        spark=spark,
+                        entity_type="wcl_matches",
+                        entity_key=report_code,
+                        error_type=error_type,
+                        error_message=str(e),
+                        payload_snapshot=f'{{"report_code": "{report_code}", "data_type": "fights"}}',
+                        season=season,
+                        sub_path="wcl_matches",
+                    )
                     continue
 
             # Find M+ fights (have keystoneLevel)
@@ -731,11 +838,22 @@ def run_fuzzy_join(
                     master_data = wcl_client.get_master_data(report_code)
                     wcl_actors = master_data.get("actors", [])
                 except (WCLRateLimitError, WCLAuthError, requests.RequestException) as e:
+                    error_type = _classify_error(e)
                     logger.warning(
                         "Failed to fetch master data for %s (%s): %s",
                         report_code,
-                        type(e).__name__,
+                        error_type,
                         e,
+                    )
+                    write_dead_letter(
+                        spark=spark,
+                        entity_type="wcl_matches",
+                        entity_key=report_code,
+                        error_type=error_type,
+                        error_message=str(e),
+                        payload_snapshot=f'{{"report_code": "{report_code}", "data_type": "master_data"}}',
+                        season=season,
+                        sub_path="wcl_matches",
                     )
 
                 for fight in candidates:
@@ -813,6 +931,11 @@ def run_fuzzy_join(
     if not dry_run and last_flush_idx < len(matches):
         batch = matches[last_flush_idx:]
         flush_matches(spark, batch, season)
+
+    # Flush any remaining DLQ records
+    dlq_count = flush_dead_letter(spark, "wcl_matches")
+    if dlq_count > 0:
+        logger.warning("DLQ: flushed %d remaining records to silver/dead_letter/wcl_matches", dlq_count)
 
     logger.info("Total matches found: %d", len(matches))
     return matches

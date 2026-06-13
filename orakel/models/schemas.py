@@ -308,3 +308,18 @@ dim_spec_schema = StructType(
         StructField("is_dps", BooleanType(), nullable=True),
     ]
 )
+
+# ─── Dead Letter Queue Schema ──────────────────────────────────────────────
+
+dead_letter_schema = StructType(
+    [
+        StructField("entity_type", StringType(), nullable=False),
+        StructField("entity_key", StringType(), nullable=False),
+        StructField("error_type", StringType(), nullable=False),
+        StructField("error_message", StringType(), nullable=True),
+        StructField("payload_snapshot", StringType(), nullable=True),
+        StructField("occurred_at", TimestampType(), nullable=False),
+        StructField("retried", BooleanType(), nullable=False),
+        StructField("season", StringType(), nullable=False),
+    ]
+)
