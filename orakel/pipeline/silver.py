@@ -30,7 +30,7 @@ class SilverPipeline:
     """Silver-layer transformations: dedup, type enforcement, struct flattening."""
 
     @staticmethod
-    def clean_raiderio(spark: SparkSession, season: str) -> DataFrame:
+    def clean_raiderio(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Read Bronze Raider.IO data, clean and dedup, write Silver Parquet.
 
         Steps:
@@ -44,6 +44,8 @@ class SilverPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter (e.g. "season-tww-3").
+            write: If True (default), write result to Silver Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
             Cleaned Silver DataFrame (before write, for row-count reporting).
@@ -84,19 +86,20 @@ class SilverPipeline:
 
         # ── Write to Silver Parquet ────────────────────────────────────────
         silver_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
-        logger.info("Writing %d rows to %s", silver_df.count(), silver_path)
 
         # Re-count after filter for accurate write count
         write_count = silver_df.count()
-        silver_df.write.mode("overwrite").partitionBy("season").parquet(
-            silver_path
-        )
 
-        logger.info(
-            "Silver Raider.IO write complete: %d rows to %s",
-            write_count,
-            silver_path,
-        )
+        if write:
+            logger.info("Writing %d rows to %s", write_count, silver_path)
+            silver_df.write.mode("overwrite").partitionBy("season").parquet(
+                silver_path
+            )
+            logger.info(
+                "Silver Raider.IO write complete: %d rows to %s",
+                write_count,
+                silver_path,
+            )
 
         return silver_df
 
@@ -150,7 +153,7 @@ class SilverPipeline:
             return roster_col
 
     @staticmethod
-    def apply_fuzzy_join(spark: SparkSession, season: str) -> tuple[DataFrame, DataFrame]:
+    def apply_fuzzy_join(spark: SparkSession, season: str, *, write: bool = True) -> tuple[DataFrame, DataFrame]:
         """Join Raider.IO runs with WCL data using the match manifest.
 
         Reads the match manifest from ``silver/matches/``, joins with
@@ -161,6 +164,8 @@ class SilverPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write results to Silver Parquet. If False,
+                return DataFrames without writing (useful for Dagster asset wrappers).
 
         Returns:
             Tuple of (dungeon_runs_df, player_performance_df).
@@ -452,17 +457,18 @@ class SilverPipeline:
         dr_count = dungeon_runs.count()
         pp_count = player_perf_df.count()
 
-        logger.info("Writing %d dungeon_runs to %s", dr_count, dr_path)
-        dungeon_runs.write.mode("overwrite").partitionBy("season").parquet(dr_path)
+        if write:
+            logger.info("Writing %d dungeon_runs to %s", dr_count, dr_path)
+            dungeon_runs.write.mode("overwrite").partitionBy("season").parquet(dr_path)
 
-        logger.info("Writing %d player_performance to %s", pp_count, pp_path)
-        player_perf_df.write.mode("overwrite").partitionBy("season").parquet(pp_path)
+            logger.info("Writing %d player_performance to %s", pp_count, pp_path)
+            player_perf_df.write.mode("overwrite").partitionBy("season").parquet(pp_path)
 
-        logger.info(
-            "Silver fuzzy join complete: %d dungeon_runs, %d player_performance",
-            dr_count,
-            pp_count,
-        )
+            logger.info(
+                "Silver fuzzy join complete: %d dungeon_runs, %d player_performance",
+                dr_count,
+                pp_count,
+            )
 
         return dungeon_runs, player_perf_df
 

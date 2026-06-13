@@ -445,11 +445,16 @@ class WarcraftLogsClient:
         fight_ids: list[int],
         data_type: str,
     ) -> list[dict[str, Any]]:
-        """Fetch raw events from WCL for specific fights.
+        """Fetch raw events from WCL for specific fights with pagination.
 
         Used for Interrupt events (KPI 3). WCL events query returns
         a ReportEventPaginator with ``data`` as a JSON list and
-        ``nextPageTimestamp`` for pagination.
+        ``nextPageTimestamp`` for pagination. This method loops through
+        all pages until ``nextPageTimestamp`` is null.
+
+        Each page costs ~5 WCL points. If the point budget is exhausted
+        mid-pagination, the method returns the partial events collected
+        so far and logs a warning.
 
         Args:
             report_code: WCL report code.
@@ -457,17 +462,20 @@ class WarcraftLogsClient:
             data_type: Event type, e.g. "Interrupts".
 
         Returns:
-            List of event dicts.
+            List of event dicts (may be partial if budget exhausted).
         """
         all_events: list[dict[str, Any]] = []
-        if not self.rate_limiter.wait_if_needed(150):
+        POINTS_PER_PAGE = 5
+
+        # Initial budget check
+        if not self.rate_limiter.wait_if_needed(POINTS_PER_PAGE):
             raise WCLRateLimitError(f"WCL point budget exhausted, cannot fetch {data_type} events")
 
         query = """
-        query GetEvents($code: String!, $fightIDs: [Int]!, $dataType: EventDataType!) {
+        query GetEvents($code: String!, $fightIDs: [Int]!, $dataType: EventDataType!, $startTime: Float) {
             reportData {
                 report(code: $code) {
-                    events(dataType: $dataType, fightIDs: $fightIDs) {
+                    events(dataType: $dataType, fightIDs: $fightIDs, startTime: $startTime) {
                         data
                         nextPageTimestamp
                     }
@@ -476,22 +484,55 @@ class WarcraftLogsClient:
         }
         """
 
-        variables = {
-            "code": report_code,
-            "fightIDs": fight_ids,
-            "dataType": data_type,
-        }
+        next_page_timestamp: float | None = None
+        page_num = 0
 
-        result = self.query(query, variables)
-        report_data = result.get("data", {}).get("reportData", {}).get("report", {})
-        events_data = report_data.get("events", {})
+        while True:
+            # Check point budget for each page request
+            if page_num > 0:
+                if not self.rate_limiter.wait_if_needed(POINTS_PER_PAGE):
+                    logger.warning(
+                        "WCL point budget exhausted mid-pagination for %s events "
+                        "in report %s after %d pages, %d events collected. "
+                        "Returning partial results.",
+                        data_type, report_code, page_num, len(all_events),
+                    )
+                    return all_events
 
-        if isinstance(events_data, dict):
-            # data field is a raw JSON list (no sub-fields allowed)
-            raw_data = events_data.get("data", [])
-            if isinstance(raw_data, list):
-                all_events.extend(raw_data)
-            elif isinstance(raw_data, dict):
-                all_events.extend(raw_data.get("entries", raw_data.get("data", [])))
+            variables: dict[str, Any] = {
+                "code": report_code,
+                "fightIDs": fight_ids,
+                "dataType": data_type,
+            }
+            if next_page_timestamp is not None:
+                variables["startTime"] = next_page_timestamp
 
+            result = self.query(query, variables)
+            report_data = result.get("data", {}).get("reportData", {}).get("report", {})
+            events_data = report_data.get("events", {})
+
+            if isinstance(events_data, dict):
+                raw_data = events_data.get("data", [])
+                if isinstance(raw_data, list):
+                    all_events.extend(raw_data)
+                elif isinstance(raw_data, dict):
+                    all_events.extend(raw_data.get("entries", raw_data.get("data", [])))
+
+            # Check for next page
+            next_ts = events_data.get("nextPageTimestamp") if isinstance(events_data, dict) else None
+            page_num += 1
+
+            if next_ts is None:
+                break
+
+            next_page_timestamp = next_ts
+            logger.debug(
+                "WCL pagination: page %d for %s in report %s, %d events so far, next_ts=%s",
+                page_num, data_type, report_code, len(all_events), next_ts,
+            )
+
+        logger.info(
+            "WCL pagination complete: %d pages, %d %s events for report %s",
+            page_num, len(all_events), data_type, report_code,
+        )
         return all_events

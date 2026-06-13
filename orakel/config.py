@@ -47,5 +47,13 @@ class Settings:
     # Season
     SEASON: str = field(default_factory=lambda: os.getenv("SEASON", "season-tww-3"))
 
+    # MLflow
+    MLFLOW_TRACKING_URI: str = field(
+        default_factory=lambda: os.getenv(
+            "MLFLOW_TRACKING_URI",
+            f"file:///{str(Path(__file__).resolve().parent.parent / 'mlruns')}",
+        )
+    )
+
 
 settings = Settings()

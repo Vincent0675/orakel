@@ -137,6 +137,45 @@ class GoldPipeline:
     """Gold-layer transformations: KPI aggregations and dimension tables."""
 
     @staticmethod
+    def _read_lookup_or_fallback(
+        spark: SparkSession,
+        lookup_path: str,
+        hardcoded_data: list[dict],
+        schema: "StructType",
+    ) -> DataFrame:
+        """Try to read a Parquet lookup table; fall back to hardcoded data.
+
+        Attempts to read the Parquet file at ``lookup_path``. If the path
+        does not exist or contains no data, creates a DataFrame from the
+        hardcoded fallback data using the provided schema and logs a warning.
+
+        Args:
+            spark: Active SparkSession.
+            lookup_path: Full s3a:// path to the Parquet lookup table.
+            hardcoded_data: Fallback list of dicts (hardcoded in-module).
+            schema: StructType schema for the fallback DataFrame.
+
+        Returns:
+            DataFrame with the lookup data.
+        """
+        try:
+            df = spark.read.parquet(lookup_path)
+            count = df.count()
+            if count > 0:
+                logger.info("Loaded lookup table from %s (%d rows)", lookup_path, count)
+                return df
+            # Empty Parquet — fall through to fallback
+            logger.warning("Lookup table %s is empty, using hardcoded fallback", lookup_path)
+        except (AnalysisException, Py4JError, OSError) as e:
+            logger.warning(
+                "Lookup table %s not found (%s: %s), using hardcoded fallback",
+                lookup_path,
+                type(e).__name__,
+                e,
+            )
+        return spark.createDataFrame(hardcoded_data, schema=schema)
+
+    @staticmethod
     def _build_comp_signature(roster_col: F.Column) -> F.Column:
         """Build a composition signature string from the roster array.
 
@@ -173,7 +212,7 @@ class GoldPipeline:
         return F.concat_ws(":", sorted_sig)
 
     @staticmethod
-    def compute_kpi_synergy(spark: SparkSession, season: str) -> DataFrame:
+    def compute_kpi_synergy(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Compute KPI 4 — Composition Synergy Score.
 
         Groups Silver dungeon_runs by (dungeon_id, key_level, affix_ids,
@@ -185,9 +224,11 @@ class GoldPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with synergy KPI columns, written to Gold.
+            DataFrame with synergy KPI columns.
         """
         silver_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
         logger.info("Reading Silver data from %s", silver_path)
@@ -260,31 +301,34 @@ class GoldPipeline:
         # ── Write to Gold ──────────────────────────────────────────────────
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_composition_synergy"
         row_count = result.count()
-        logger.info("Writing %d rows to %s", row_count, gold_path)
 
-        result.write.mode("overwrite").parquet(gold_path)
-
-        logger.info(
-            "KPI 4 (Composition Synergy) written: %d rows to %s",
-            row_count,
-            gold_path,
-        )
+        if write:
+            logger.info("Writing %d rows to %s", row_count, gold_path)
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info(
+                "KPI 4 (Composition Synergy) written: %d rows to %s",
+                row_count,
+                gold_path,
+            )
 
         return result
 
     @staticmethod
-    def build_dim_dungeon(spark: SparkSession, season: str) -> DataFrame:
+    def build_dim_dungeon(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Build the dungeon dimension table from Silver data.
 
         Extracts unique dungeons from Silver raiderio_runs and enriches
-        with hardcoded timer data for TWW Season 3.
+        with timer data from the lookup table at ``bronze/lookups/dim_dungeon_timer/``.
+        Falls back to hardcoded ``_TWW3_DUNGEONS`` if the lookup table is missing.
 
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with dim_dungeon columns, written to Gold.
+            DataFrame with dim_dungeon columns.
         """
         silver_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
         silver_df = spark.read.parquet(silver_path).filter(
@@ -297,21 +341,15 @@ class GoldPipeline:
             F.col("dungeon_name"),
         ).distinct()
 
-        # Create hardcoded timer data
-        timer_data = spark.createDataFrame(
-            _TWW3_DUNGEONS,
-            schema=StructType([
-                StructField("dungeon_id", IntegerType(), nullable=False),
-                StructField("dungeon_name", StringType(), nullable=True),
-                StructField("slug", StringType(), nullable=True),
-                StructField("keystone_timer_ms", LongType(), nullable=True),
-                StructField("season", StringType(), nullable=True),
-            ]),
+        # Load timer data from lookup table (with hardcoded fallback)
+        lookup_path = f"s3a://{settings.MINIO_BUCKET}/bronze/lookups/dim_dungeon_timer"
+        timer_data = GoldPipeline._read_lookup_or_fallback(
+            spark, lookup_path, _TWW3_DUNGEONS, dim_dungeon_schema,
         )
 
         # Left join data with timers (to get slugs and timer info)
         dim = dungeons_from_data.join(
-            timer_data,
+            timer_data.select("dungeon_id", "dungeon_name", "slug", "keystone_timer_ms"),
             on=["dungeon_id", "dungeon_name"],
             how="left",
         )
@@ -330,13 +368,15 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_dungeon"
         row_count = dim.count()
-        dim.write.mode("overwrite").parquet(gold_path)
 
-        logger.info("dim_dungeon written: %d rows to %s", row_count, gold_path)
+        if write:
+            dim.write.mode("overwrite").parquet(gold_path)
+            logger.info("dim_dungeon written: %d rows to %s", row_count, gold_path)
+
         return dim
 
     @staticmethod
-    def build_dim_player(spark: SparkSession, season: str) -> DataFrame:
+    def build_dim_player(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Build the player dimension table from Silver data.
 
         Explodes the roster array to extract individual players with
@@ -345,9 +385,11 @@ class GoldPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with dim_player columns, written to Gold.
+            DataFrame with dim_player columns.
         """
         silver_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
         silver_df = spark.read.parquet(silver_path).filter(
@@ -399,54 +441,76 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_player"
         row_count = dim.count()
-        dim.write.mode("overwrite").parquet(gold_path)
 
-        logger.info("dim_player written: %d rows to %s", row_count, gold_path)
+        if write:
+            dim.write.mode("overwrite").parquet(gold_path)
+            logger.info("dim_player written: %d rows to %s", row_count, gold_path)
+
         return dim
 
     @staticmethod
-    def build_dim_affix(spark: SparkSession, season: str) -> DataFrame:
-        """Build the affix dimension table (hardcoded for MVP).
+    def build_dim_affix(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
+        """Build the affix dimension table.
+
+        Loads data from the lookup table at ``bronze/lookups/dim_affix/``.
+        Falls back to hardcoded ``_TWW3_AFFIXES`` if the lookup table is missing.
 
         Args:
             spark: Active SparkSession.
             season: Season identifier.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with dim_affix columns, written to Gold.
+            DataFrame with dim_affix columns.
         """
-        dim = spark.createDataFrame(_TWW3_AFFIXES, schema=dim_affix_schema)
+        lookup_path = f"s3a://{settings.MINIO_BUCKET}/bronze/lookups/dim_affix"
+        dim = GoldPipeline._read_lookup_or_fallback(
+            spark, lookup_path, _TWW3_AFFIXES, dim_affix_schema,
+        )
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_affix"
         row_count = dim.count()
-        dim.write.mode("overwrite").parquet(gold_path)
 
-        logger.info("dim_affix written: %d rows to %s", row_count, gold_path)
+        if write:
+            dim.write.mode("overwrite").parquet(gold_path)
+            logger.info("dim_affix written: %d rows to %s", row_count, gold_path)
+
         return dim
 
     @staticmethod
-    def build_dim_spec(spark: SparkSession) -> DataFrame:
-        """Build the spec-role mapping dimension table (hardcoded for MVP).
+    def build_dim_spec(spark: SparkSession, *, write: bool = True) -> DataFrame:
+        """Build the spec-role mapping dimension table.
+
+        Loads data from the lookup table at ``bronze/lookups/dim_spec_role/``.
+        Falls back to hardcoded ``_WOW_SPEC_ROLE_MAP`` if the lookup table is missing.
 
         Args:
             spark: Active SparkSession.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with dim_spec columns, written to Gold.
+            DataFrame with dim_spec columns.
         """
-        dim = spark.createDataFrame(_WOW_SPEC_ROLE_MAP, schema=dim_spec_schema)
+        lookup_path = f"s3a://{settings.MINIO_BUCKET}/bronze/lookups/dim_spec_role"
+        dim = GoldPipeline._read_lookup_or_fallback(
+            spark, lookup_path, _WOW_SPEC_ROLE_MAP, dim_spec_schema,
+        )
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_spec"
         row_count = dim.count()
-        dim.write.mode("overwrite").parquet(gold_path)
 
-        logger.info("dim_spec written: %d rows to %s", row_count, gold_path)
+        if write:
+            dim.write.mode("overwrite").parquet(gold_path)
+            logger.info("dim_spec written: %d rows to %s", row_count, gold_path)
+
         return dim
 
     # ─── KPI 1: Tank Death Clock ───────────────────────────────────────────
 
     @staticmethod
-    def compute_kpi_death_clock(spark: SparkSession, season: str) -> DataFrame:
+    def compute_kpi_death_clock(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Compute KPI 1 — Tank Death Clock per run.
 
         Death Clock = EHP / (DTPS - HPS_on_tank)
@@ -461,9 +525,11 @@ class GoldPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with Tank Death Clock KPI, written to Gold.
+            DataFrame with Tank Death Clock KPI.
         """
         # Try to read from silver/player_performance if available
         pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
@@ -481,7 +547,7 @@ class GoldPipeline:
             # Fallback: use silver/raiderio_runs with estimated stats
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season, write=write)
 
         # Filter to tanks only
         tanks = player_perf.filter(F.col("role") == "tank")
@@ -491,7 +557,7 @@ class GoldPipeline:
             logger.warning("No tank data found in player_performance.")
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season, write=write)
 
         # Compute DTPS and HPS for tanks
         # DTPS = total_damage_taken / (fight_duration_ms / 1000)
@@ -541,7 +607,7 @@ class GoldPipeline:
             )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_death_clock_from_raiderio(spark, rio_df, season, write=write)
 
         # Register KPI UDF
         death_clock_udf = F.udf(
@@ -585,14 +651,16 @@ class GoldPipeline:
         # Write to Gold
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info("KPI 1 (Tank Death Clock): %d rows written to %s", row_count, gold_path)
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info("KPI 1 (Tank Death Clock): %d rows written to %s", row_count, gold_path)
 
         return result
 
     @staticmethod
     def _compute_death_clock_from_raiderio(
-        spark: SparkSession, rio_df: DataFrame, season: str
+        spark: SparkSession, rio_df: DataFrame, season: str, *, write: bool = True
     ) -> DataFrame:
         """Compute a placeholder Death Clock using Raider.IO data only.
 
@@ -636,18 +704,21 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info(
-            "KPI 1 (Tank Death Clock, raiderio-only): %d rows written to %s",
-            row_count,
-            gold_path,
-        )
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info(
+                "KPI 1 (Tank Death Clock, raiderio-only): %d rows written to %s",
+                row_count,
+                gold_path,
+            )
+
         return result
 
     # ─── KPI 2: Healer Deficit ─────────────────────────────────────────────
 
     @staticmethod
-    def compute_kpi_healer_deficit(spark: SparkSession, season: str) -> DataFrame:
+    def compute_kpi_healer_deficit(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Compute KPI 2 — Healer Deficit per run.
 
         Deficit = Tank_DTPS / Healer_HPS_on_tank
@@ -660,9 +731,11 @@ class GoldPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with Healer Deficit KPI, written to Gold.
+            DataFrame with Healer Deficit KPI.
         """
         pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
         try:
@@ -678,7 +751,7 @@ class GoldPipeline:
             )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season, write=write)
 
         # Separate tanks and healers
         # Bug #1 fix: total_healing_received now represents healing RECEIVED by
@@ -705,7 +778,7 @@ class GoldPipeline:
             logger.warning("No tank or healer data found. Producing empty KPI 2.")
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_healer_deficit_from_raiderio(spark, rio_df, season, write=write)
 
         joined = tanks.join(
             healers,
@@ -777,14 +850,16 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info("KPI 2 (Healer Deficit): %d rows written to %s", row_count, gold_path)
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info("KPI 2 (Healer Deficit): %d rows written to %s", row_count, gold_path)
 
         return result
 
     @staticmethod
     def _compute_healer_deficit_from_raiderio(
-        spark: SparkSession, rio_df: DataFrame, season: str
+        spark: SparkSession, rio_df: DataFrame, season: str, *, write: bool = True
     ) -> DataFrame:
         """Compute placeholder Healer Deficit from Raider.IO data only."""
         healers = rio_df.select(
@@ -807,18 +882,21 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info(
-            "KPI 2 (Healer Deficit, raiderio-only): %d rows written to %s",
-            row_count,
-            gold_path,
-        )
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info(
+                "KPI 2 (Healer Deficit, raiderio-only): %d rows written to %s",
+                row_count,
+                gold_path,
+            )
+
         return result
 
     # ─── KPI 3: Interrupt Rate (count + per-minute) ─────────────────────────
 
     @staticmethod
-    def compute_kpi_interrupt_rate(spark: SparkSession, season: str) -> DataFrame:
+    def compute_kpi_interrupt_rate(spark: SparkSession, season: str, *, write: bool = True) -> DataFrame:
         """Compute KPI 3 — Interrupt Rate per player per run.
 
         Two metrics derived from WCL interrupts:
@@ -832,9 +910,11 @@ class GoldPipeline:
         Args:
             spark: Active SparkSession.
             season: Season filter.
+            write: If True (default), write result to Gold Parquet. If False,
+                return DataFrame without writing (useful for Dagster asset wrappers).
 
         Returns:
-            DataFrame with Interrupt Rate KPI, written to Gold.
+            DataFrame with Interrupt Rate KPI.
         """
         pp_path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
         try:
@@ -850,7 +930,7 @@ class GoldPipeline:
             )
             rio_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
             rio_df = spark.read.parquet(rio_path).filter(F.col("season") == season)
-            return GoldPipeline._compute_interrupt_rate_from_raiderio(spark, rio_df, season)
+            return GoldPipeline._compute_interrupt_rate_from_raiderio(spark, rio_df, season, write=write)
 
         # Compute interrupts_per_minute: normalize by fight duration
         result = player_perf.withColumn(
@@ -902,14 +982,16 @@ class GoldPipeline:
         # These require WCL event-level data which may not be available
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info("KPI 3 (Interrupt Rate): %d rows written to %s", row_count, gold_path)
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info("KPI 3 (Interrupt Rate): %d rows written to %s", row_count, gold_path)
 
         return result
 
     @staticmethod
     def _compute_interrupt_rate_from_raiderio(
-        spark: SparkSession, rio_df: DataFrame, season: str
+        spark: SparkSession, rio_df: DataFrame, season: str, *, write: bool = True
     ) -> DataFrame:
         """Compute placeholder Interrupt metrics from Raider.IO data only (no WCL)."""
         players = rio_df.select(
@@ -931,10 +1013,13 @@ class GoldPipeline:
 
         gold_path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
         row_count = result.count()
-        result.write.mode("overwrite").parquet(gold_path)
-        logger.info(
-            "KPI 3 (Interrupt Rate, raiderio-only): %d rows written to %s",
-            row_count,
-            gold_path,
-        )
+
+        if write:
+            result.write.mode("overwrite").parquet(gold_path)
+            logger.info(
+                "KPI 3 (Interrupt Rate, raiderio-only): %d rows written to %s",
+                row_count,
+                gold_path,
+            )
+
         return result

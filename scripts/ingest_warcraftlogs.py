@@ -26,7 +26,7 @@ from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField,
 
 from orakel.clients.warcraftlogs import WCLAuthError, WCLRateLimitError, WarcraftLogsClient
 from orakel.config import settings
-from orakel.models.schemas import bronze_wcl_events_schema, bronze_wcl_reports_schema
+from orakel.models.schemas import bronze_wcl_events_schema, bronze_wcl_reports_schema, dead_letter_schema
 from orakel.utils.minio import get_spark_session
 
 # ─── Checkpoint Schema ─────────────────────────────────────────────────────────
@@ -42,6 +42,90 @@ CHECKPOINT_SCHEMA = StructType([
 ])
 
 logger = logging.getLogger(__name__)
+
+# ─── Dead-Letter Queue helpers ──────────────────────────────────────────────
+
+_dlq_buffer: list[dict] = []
+
+
+def write_dead_letter(
+    spark: SparkSession,
+    entity_type: str,
+    entity_key: str,
+    error_type: str,
+    error_message: str,
+    payload_snapshot: str,
+    season: str,
+    sub_path: str,
+) -> None:
+    """Write a single record to the dead-letter queue on MinIO.
+
+    Args:
+        spark: Active SparkSession.
+        entity_type: Type of entity that failed (e.g. "wcl_events", "wcl_table").
+        entity_key: Identifier for the failed entity (e.g. report_code).
+        error_type: Short error category (e.g. "rate_limit", "auth_error", "timeout").
+        error_message: Full error message or traceback.
+        payload_snapshot: JSON snapshot of the input that failed (truncated to 1KB).
+        season: Season identifier for partitioning.
+        sub_path: DLQ sub-path (e.g. "wcl_events", "wcl_table").
+    """
+    # Truncate payload snapshot to 1KB
+    if len(payload_snapshot) > 1024:
+        payload_snapshot = payload_snapshot[:1024] + "...[truncated]"
+
+    record = {
+        "entity_type": entity_type,
+        "entity_key": entity_key,
+        "error_type": error_type,
+        "error_message": error_message[:2000] if error_message else "",
+        "payload_snapshot": payload_snapshot,
+        "occurred_at": datetime.now(timezone.utc),
+        "retried": False,
+        "season": season,
+    }
+    _dlq_buffer.append(record)
+
+    # Flush to MinIO every 50 records or on critical threshold
+    if len(_dlq_buffer) >= 50:
+        flush_dead_letter(spark, sub_path)
+
+
+def flush_dead_letter(spark: SparkSession, sub_path: str) -> int:
+    """Flush buffered dead-letter records to MinIO Parquet.
+
+    Args:
+        spark: Active SparkSession.
+        sub_path: DLQ sub-path (e.g. "wcl_events", "wcl_table").
+
+    Returns:
+        Number of records flushed.
+    """
+    global _dlq_buffer
+    if not _dlq_buffer:
+        return 0
+
+    df = spark.createDataFrame(_dlq_buffer, schema=dead_letter_schema)
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/dead_letter/{sub_path}"
+    count = df.count()
+    df.write.mode("append").partitionBy("season").parquet(path)
+    logger.warning("DLQ: flushed %d records to %s", count, path)
+    flushed = len(_dlq_buffer)
+    _dlq_buffer = []
+    return flushed
+
+
+def _classify_error(error: Exception) -> str:
+    """Classify an exception into a short error type string for DLQ."""
+    if isinstance(error, WCLRateLimitError):
+        return "rate_limit"
+    if isinstance(error, WCLAuthError):
+        return "auth_error"
+    if isinstance(error, requests.Timeout):
+        return "timeout"
+    if isinstance(error, requests.HTTPError):
+        return "http_error"
+    return type(error).__name__
 
 
 def load_match_manifest(spark: SparkSession, season: str) -> list[dict]:
@@ -66,6 +150,8 @@ def ingest_damage_taken(
     wcl_client: WarcraftLogsClient,
     report_code: str,
     fight_ids: list[int],
+    spark: SparkSession | None = None,
+    season: str = "",
 ) -> list[dict]:
     """Fetch DamageTaken table data for given fights.
 
@@ -73,13 +159,15 @@ def ingest_damage_taken(
         wcl_client: Authenticated WCL client.
         report_code: WCL report code.
         fight_ids: List of fight IDs.
+        spark: Active SparkSession (for DLQ writes).
+        season: Season string (for DLQ partitioning).
 
     Returns:
         List of damage event dicts.
     """
     events = []
-    try:
-        for fid in fight_ids:
+    for fid in fight_ids:
+        try:
             table = wcl_client.get_table(report_code, [fid], "DamageTaken")
             table_data = table.get("data", {})
             entries = table_data.get("entries", []) if isinstance(table_data, dict) else table.get("entries", [])
@@ -98,8 +186,34 @@ def ingest_damage_taken(
                     "fight_id": fid,
                     "report_code": report_code,
                 })
-    except (WCLRateLimitError, Exception) as e:
-        logger.warning("Failed to fetch DamageTaken for %s fight %s: %s", report_code, fight_ids, e)
+        except (WCLRateLimitError, WCLAuthError, requests.Timeout, requests.HTTPError) as e:
+            error_type = _classify_error(e)
+            logger.warning("Failed to fetch DamageTaken for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_table",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "DamageTaken"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
+        except Exception as e:
+            error_type = _classify_error(e)
+            logger.warning("Unexpected error fetching DamageTaken for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_table",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "DamageTaken"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
     return events
 
 
@@ -108,6 +222,8 @@ def ingest_healing(
     report_code: str,
     fight_ids: list[int],
     actor_map: dict[int, str] | None = None,
+    spark: SparkSession | None = None,
+    season: str = "",
 ) -> list[dict]:
     """Fetch Healing table data for given fights.
 
@@ -126,13 +242,15 @@ def ingest_healing(
         report_code: WCL report code.
         fight_ids: List of fight IDs.
         actor_map: Dict mapping actor_id → player_name from masterData.
+        spark: Active SparkSession (for DLQ writes).
+        season: Season string (for DLQ partitioning).
 
     Returns:
         List of healing event dicts with target_name populated where available.
     """
     events = []
-    try:
-        for fid in fight_ids:
+    for fid in fight_ids:
+        try:
             table = wcl_client.get_table(report_code, [fid], "Healing")
             table_data = table.get("data", {})
             entries = table_data.get("entries", []) if isinstance(table_data, dict) else table.get("entries", [])
@@ -184,8 +302,34 @@ def ingest_healing(
                         "fight_id": fid,
                         "report_code": report_code,
                     })
-    except (WCLRateLimitError, Exception) as e:
-        logger.warning("Failed to fetch Healing for %s fight %s: %s", report_code, fight_ids, e)
+        except (WCLRateLimitError, WCLAuthError, requests.Timeout, requests.HTTPError) as e:
+            error_type = _classify_error(e)
+            logger.warning("Failed to fetch Healing for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_table",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "Healing"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
+        except Exception as e:
+            error_type = _classify_error(e)
+            logger.warning("Unexpected error fetching Healing for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_table",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "Healing"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
     return events
 
 
@@ -194,6 +338,8 @@ def ingest_interrupts(
     report_code: str,
     fight_ids: list[int],
     actor_map: dict[int, str] | None = None,
+    spark: SparkSession | None = None,
+    season: str = "",
 ) -> list[dict]:
     """Fetch Interrupt events for given fights.
 
@@ -204,13 +350,15 @@ def ingest_interrupts(
         report_code: WCL report code.
         fight_ids: List of fight IDs.
         actor_map: Dict mapping actor_id → player_name from masterData.
+        spark: Active SparkSession (for DLQ writes).
+        season: Season string (for DLQ partitioning).
 
     Returns:
         List of interrupt event dicts with resolved player_name.
     """
     events = []
-    try:
-        for fid in fight_ids:
+    for fid in fight_ids:
+        try:
             raw_events = wcl_client.get_events(report_code, [fid], "Interrupts")
             for evt in raw_events:
                 source_id = evt.get("sourceID", 0)
@@ -229,8 +377,34 @@ def ingest_interrupts(
                     "fight_id": fid,
                     "report_code": report_code,
                 })
-    except (WCLRateLimitError, Exception) as e:
-        logger.warning("Failed to fetch Interrupts for %s fight %s: %s", report_code, fight_ids, e)
+        except (WCLRateLimitError, WCLAuthError, requests.Timeout, requests.HTTPError) as e:
+            error_type = _classify_error(e)
+            logger.warning("Failed to fetch Interrupts for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_events",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "Interrupts"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
+        except Exception as e:
+            error_type = _classify_error(e)
+            logger.warning("Unexpected error fetching Interrupts for %s fight %s: [%s] %s", report_code, fid, error_type, e)
+            if spark and season:
+                write_dead_letter(
+                    spark=spark,
+                    entity_type="wcl_events",
+                    entity_key=f"{report_code}:{fid}",
+                    error_type=error_type,
+                    error_message=str(e),
+                    payload_snapshot=f'{{"report_code": "{report_code}", "fight_ids": [{fid}], "data_type": "Interrupts"}}',
+                    season=season,
+                    sub_path="wcl_events",
+                )
     return events
 
 
@@ -548,6 +722,13 @@ def main() -> None:
         logger.info("WCL events ingestion complete. Summary:")
         logger.info("  Reports processed this run: %d", total_reports)
         logger.info("  Total WCL points spent: %d", wcl_client.rate_limiter.total_spent)
+
+        # Flush any remaining DLQ records
+        for sub_path in ["wcl_table", "wcl_events"]:
+            count = flush_dead_letter(spark, sub_path)
+            if count > 0:
+                logger.warning("DLQ: flushed %d remaining records to silver/dead_letter/%s", count, sub_path)
+
         logger.info("=" * 60)
 
     except Exception as e:
