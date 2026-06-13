@@ -33,3 +33,14 @@ jars/
 
 # Docs aparte
 Asignación de Proyecto Integrador.md
+
+# Coverage reports
+.coverage
+coverage/
+
+# MLflow local database
+mlflow.db
+mlflow/
+
+# Skill registry cache (auto-generated)
+.atl/.skill-registry.cache.json
