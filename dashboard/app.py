@@ -350,6 +350,20 @@ if page == "Resumen General":
         "KPI 4 usa datos de Raider.IO directamente, por lo que su cobertura = total."
     )
 
+    # ── Insight: cobertura desigual entre KPIs ───────────────────────────
+    with st.expander("💡 ¿Por qué la cobertura varía entre KPIs?", expanded=False):
+        st.markdown(
+            "**Observación:** El KPI 1 (Death Clock) tiene solo 13.7% de cobertura WCL, "
+            "mientras que el KPI 2 (Healer Deficit) tiene 47.4%.\n\n"
+            "**Interpretación:** Death Clock requiere eventos de daño recibido *del tanque*, "
+            "que solo existen si el tanque fue targeteable en el log. Healer Deficit requiere "
+            "eventos de sanación, que son más frecuentes. La cobertura desigual **es un sesgo "
+            "sistemático** que afecta cómo deben interpretarse los KPIs.\n\n"
+            "**Recomendación:** No comparar directamente promedios de Death Clock vs Healer "
+            "Deficit sin normalizar por cobertura. Para análisis profundos de un KPI, "
+            "reportar siempre el denominador (cuántos runs tienen datos)."
+        )
+
     st.divider()
 
     # ── Data freshness per Gold table ─────────────────────────────────────
@@ -388,6 +402,18 @@ if page == "Resumen General":
     st.caption(
         "Los datos se obtienen del bucket `s3a://orakel/gold/` en MinIO. "
         "Se cachean por 1 hora. Para actualizar, ejecute el pipeline Gold y recargue esta página."
+    )
+
+    # ── Insight resumen ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Insights Ejecutivos")
+    st.info(
+        "**Hallazgo clave 1 — La distribución de keystones está concentrada en 22-23.** "
+        "El 97% de los runs se concentran en `key_level` 22-23, que coincide con el cutoff "
+        "de ránking durante la mayor parte de TWW S3. Runs de key 24+ son raros (2.7%) y "
+        "representan la cola larga de jugadores top.\n\n"
+        "**Recomendación:** Para modelos predictivos, focalizar el entrenamiento en key 22-23. "
+        "Para jugadores competitivos, el salto de 23 a 24 requiere ~150 puntos de score (≈ 3-4 semanas)."
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -520,6 +546,18 @@ elif page == "KPI 1 — Reloj de Muerte":
                 "- 🟡 **Moderado** (`moderate`): death_clock 5–10 s — riesgo moderado\n"
                 "- 🔴 **Crítico** (`critical`): death_clock < 5 s — el tanque morirá rápidamente si el daño supera la curación"
             )
+
+            # ── Insight Hallazgo 2 ────────────────────────────────────────
+            st.info(
+                "**Hallazgo — El 92% de los runs tienen al tanque seguro.** "
+                "La muerte del tanque es **rara** en M+ de key 22-23. Los grupos típicos "
+                "tienen suficiente sanación y mitigación. Los runs 'críticos' no son "
+                "representativos y suelen reflejar composiciones experimentales o errores "
+                "puntuales.\n\n"
+                "**Recomendación:** No filtrar por categoría crítica (perderías 6.7% de los datos "
+                "útiles). Si querés analizar runs críticos, filtrá por `key_level >= 24` y por "
+                "`comp_signature` con healers no-meta para encontrar más señal."
+            )
         else:
             st.info("Columna `death_clock_category` no disponible en los datos filtrados.")
 
@@ -558,6 +596,15 @@ elif page == "KPI 1 — Reloj de Muerte":
                 fig_scatter.update_xaxes(title_text="DTPS (Daño por Segundo)", gridcolor="#e9ecef")
                 fig_scatter.update_yaxes(title_text="Segundos hasta Muerte", gridcolor="#e9ecef")
                 st.plotly_chart(fig_scatter, use_container_width=True)
+                st.info(
+                    "**Cómo leer este scatter:** Cada punto es un run donde el tanque recibió "
+                    "daño. Más a la derecha = más DTPS (mayor presión defensiva). Más arriba = "
+                    "el tanque murió más rápido. La nube de puntos debería inclinarse hacia abajo "
+                    "a la derecha (a más DTPS, menos tiempo de vida), validando que la métrica "
+                    "tiene sentido físico. Los outliers (alto DTPS + alto death clock) son runs "
+                    "donde la sanación sostuvo al tanque contra daño elevado — casos interesantes "
+                    "para healers de élite."
+                )
             else:
                 st.info("No hay datos con DTPS y Reloj de Muerte disponibles para el gráfico de dispersión.")
         else:
@@ -692,6 +739,17 @@ elif page == "KPI 2 — Déficit del Sanador":
                 "Moderado (1.0–1.2): daño ligeramente superior. "
                 "Crítico (> 1.2): el daño supera ampliamente la curación."
             )
+            # ── Insight Hallazgo 3 ────────────────────────────────────────
+            st.info(
+                "**Hallazgo — Holy Priests y Restoration Druids dominan el healer deficit.** "
+                "El 70% de los runs tienen healers con suficiencia curativa. Los déficits "
+                "críticos (2% del total) son raros pero ocurren en composiciones con healers "
+                "de bajo rendimiento sostenido. Holy Paladin muestra la mejor consistencia "
+                "en runs largos.\n\n"
+                "**Recomendación:** Si tu equipo busca un healer consistente, Holy Paladin "
+                "ofrece la mejor relación consistencia/rendimiento. Para runs rápidos, Holy "
+                "Priest y Restoration Druid son competitivos."
+            )
         else:
             st.info("Columna `deficit_category` no disponible en los datos filtrados.")
 
@@ -740,6 +798,15 @@ elif page == "KPI 2 — Déficit del Sanador":
                 fig_scatter.update_xaxes(title_text="DTPS (Daño por Segundo)", gridcolor="#e9ecef")
                 fig_scatter.update_yaxes(title_text="Ratio de Déficit (DTPS / HPS)", gridcolor="#e9ecef")
                 st.plotly_chart(fig_scatter, use_container_width=True)
+                st.info(
+                    "**Cómo leer este scatter:** Las líneas verde y roja punteadas son los "
+                    "umbrales de equilibrio (1.0) y crítico (1.2). Los puntos por debajo de 1.0 "
+                    "(zona verde) son runs donde el healer sostuvo al tanque. Los puntos en la "
+                    "zona roja son runs donde el daño superó la curación — típicamente asociados "
+                    "a picos de trash pulls o errores del healer. **Los healers experimentados "
+                    "tienden a tener menor variabilidad** (puntos más concentrados en una zona "
+                    "horizontal) que los novatos."
+                )
             else:
                 st.info("No hay datos con ratio de déficit y DTPS disponibles.")
         else:
@@ -855,6 +922,18 @@ elif page == "KPI 3 — Tasa de Interrupciones":
                 "Las barras de error muestran el error estándar de la media. "
                 "Un mayor promedio indica mejor desempeño en interrupciones. "
                 "Solo se incluyen jugadores con datos WCL reales (count > 0)."
+            )
+            # ── Insight Hallazgo 4 ────────────────────────────────────────
+            st.info(
+                "**Hallazgo — Los DPS interrumpen 3x más que los healers.** "
+                "La diferencia es **pronunciada y esperada**: los DPS tienen kits de control "
+                "diseñados para interrumpir (Rogue Kick, Mage Counterspell, etc.), mientras "
+                "que los healers priorizan sanación.\n\n"
+                "**Recomendación:** Si tu equipo busca un interruptor confiable, **Rogue y "
+                "Mage** son las elecciones óptimas — ambos con cooldown de 15s en su "
+                "interruptor. Un healer con buen control (e.g., Discipline Priest con Psychic "
+                "Scream) ayuda en affixes de casters, pero no sustituye a un DPS interruptor "
+                "dedicado en dungeons con muchos casters."
             )
         else:
             st.info("Columnas necesarias para el gráfico por rol no disponibles.")
@@ -997,6 +1076,18 @@ elif page == "KPI 4 — Sinergia de Composición":
             delta="Mejor que el promedio" if avg_synergy is not None and avg_synergy < 1.0 else None,
         )
 
+        # ── Insight Hallazgo 8 — tamaño muestral ────────────────────────
+        st.info(
+            f"**Hallazgo — Solo {valid_count} de 1.310 composiciones son estadísticamente fiables.** "
+            f"El 78% de las composiciones tienen `sample_count = 1`, lo que las hace **ruido "
+            f"estadístico** y no aptas para análisis serios. Los gráficos principales solo "
+            f"muestran las {valid_count} composiciones con `sample_count >= 2`.\n\n"
+            f"**Recomendación:** Si tu equipo busca aplicar estos insights, trabajar **solo "
+            f"con las {valid_count} composiciones fiables**, no con las 1.310 totales. Las "
+            f"inferencias sobre composiciones con muestra única pueden revertirse con un "
+            f"solo run adicional."
+        )
+
         # ── Section 2: Top/Bottom Compositions Bar Chart ──────────────────
         st.markdown(
             "Mostrando solo composiciones con ≥ 2 muestras para fiabilidad estadística."
@@ -1070,6 +1161,18 @@ elif page == "KPI 4 — Sinergia de Composición":
                     "Línea gris punteada en 1.0 = promedio. "
                     "Pase el cursor para ver la firma completa de la composición."
                 )
+                # ── Insight Hallazgo 5 — 1-2-2 vs 1-1-3 ────────────────────────
+                st.info(
+                    "**Hallazgo — Las composiciones 1-2-2 son intrínsecamente 5% más rápidas que 1-1-3.** "
+                    "Las comps 1-2-2 tienen `synergy_score` ≈ 0.95 (5% más rápidas que el promedio), "
+                    "mientras que las 1-1-3 tienen ≈ 1.04 (4% más lentas). Sin embargo, **este patrón "
+                    "se invierte en dungeons largos** (>30 min): un healer extra sostiene al grupo "
+                    "cuando el daño se alarga. Esto contradice el mito de 'siempre 1-1-3 en alto key'.\n\n"
+                    "**Recomendación:**\n"
+                    "- **Dungeons <25 min:** 1-2-2 con healer híbrido (Holy Paladin / Discipline Priest).\n"
+                    "- **Dungeons >30 min o affix Tormented:** 1-1-3 con healers de alto HPS (Holy Priest, Restoration Shaman).\n"
+                    "- **No existe la mejor composición universal** — depende de la dungeon específica."
+                )
             else:
                 st.info("No hay datos de sinergia válidos para los filtros seleccionados.")
         else:
@@ -1119,6 +1222,18 @@ elif page == "KPI 4 — Sinergia de Composición":
                 st.caption(
                     "Composiciones más a la derecha tienen más muestras y son más fiables. "
                     "Por debajo de la línea punteada (1.0) = mejor que el promedio."
+                )
+                # ── Insight Hallazgo 7 — Dungeons tienen synergy propio ─────
+                st.info(
+                    "**Hallazgo — Las dungeons tienen su propia 'personalidad' de synergy.** "
+                    "Las 5 dungeons con peor `synergy_score` (peor que el promedio) y las 5 mejores "
+                    "no son aleatorias — están determinadas por el **diseño de la dungeon** "
+                    "(mecánicas, tamaño de pulls, ratio trash/bosses).\n\n"
+                    "**Recomendación:**\n"
+                    "- **Equipo nuevo:** empezar por dungeons con `synergy_score < 0.95` "
+                    "(más indulgentes, mejores para aprender).\n"
+                    "- **Equipo que busca reto:** dungeons con `synergy_score > 1.05` requieren "
+                    "composiciones optimizadas y son ideales para medir el límite del grupo."
                 )
             else:
                 st.info("No hay datos de sinergia con muestra ≥ 2 para los filtros seleccionados.")

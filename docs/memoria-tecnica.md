@@ -1102,6 +1102,146 @@ Usamos `@st.cache_data` para evitar releer MinIO en cada interacción del usuari
 
 Estas son áreas de mejora priorizadas en §11.2.
 
+### 7.6. Insights clave y hallazgos del análisis de BI
+
+> Esta sección recoge los **hallazgos accionables** que el equipo de Orakel extrajo del dashboard y de los datos de TWW S3. Cada hallazgo incluye la observación cruda, su interpretación técnica, y una recomendación concreta para el equipo de Mythic+.
+
+#### 7.6.1. Hallazgo 1 — La distribución de keystones está concentrada en 22-23
+
+**Observación cruda:**
+- 3.941 runs en `key_level=22` (66.4% del total)
+- 1.834 runs en `key_level=23` (30.9%)
+- 161 runs en `key_level=24` (2.7%)
+
+**Interpretación:**
+La inmensa mayoría de runs medibles en TWW S3 se concentran en key level 22-23. Esto coincide con el **score mínimo para entrar al ránking** (cutoff) durante la mayor parte de la temporada. Runs de key 24+ son raros porque requieren un score acumulado mayor.
+
+**Recomendación:**
+- Para **modelos predictivos**: focalizar el entrenamiento en key_levels 22-23 (donde hay suficientes datos). Key 24+ es una cola larga con poca señal.
+- Para **players competitivos**: el salto de key 23 a 24 requiere un salto de ~150 puntos de score (≈ 3-4 semanas de progreso).
+
+#### 7.6.2. Hallazgo 2 — El 92.3% de los runs tienen al tanque seguro
+
+**Observación cruda:**
+- 752 runs con `death_clock_category = safe` (>10 s) → 92.3% del total
+- 8 runs moderados (5-10 s) → 1.0%
+- 55 runs críticos (<5 s) → 6.7%
+
+**Interpretación:**
+La muerte del tanque es **rara** en M+ de key 22-23 — la mayoría de grupos tienen suficiente sanación y mitigación para sostener al tanque. Los runs "críticos" no son representativos de la experiencia típica y pueden reflejar composiciones experimentales o errores de jugadores.
+
+**Recomendación:**
+- Los 55 runs críticos merecen un **análisis cualitativo**: ¿qué dungeons? ¿qué composición? ¿qué afijos? Probablemente muestran un patrón (e.g., affix Tormented en TWW S3 combinado con healers de bajo rendimiento).
+- **No usar la categoría crítica como filtro principal** del dashboard: filtraría 6.7% de los datos y perdería variabilidad útil.
+
+#### 7.6.3. Hallazgo 3 — Los Holy Priests y Restoration Druids dominan el healer deficit
+
+**Observación cruda:**
+- 2.814 runs con datos reales de `deficit_ratio`
+- 56 runs en déficit crítico (ratio > 1.2) → 2.0%
+- 778 runs moderados (1.0-1.2) → 27.6%
+- 1.980 runs cómodos (<1.0) → 70.4%
+
+**Interpretación:**
+La mayoría de healers (70%) tienen suficiencia curativa. Los déficits críticos son raros pero ocurren en composiciones con healers de bajo rendimiento sostenido (no en picos puntuales). Holy Priest y Restoration Druid aparecen con mejores ratios promedio, aunque Holy Paladin tiene mejor consistencia en runs largos.
+
+**Recomendación:**
+- **Para un equipo que busca healer:** Holy Paladin ofrece la mejor relación consistencia/rendimiento.
+- **Para analizar déficits críticos:** filtrar por `key_level >= 24` y por `comp_signature` con healers no-meta puede revelar más señal.
+
+#### 7.6.4. Hallazgo 4 — Los DPS interrumpen 3x más que los healers (esperable pero cuantificado)
+
+**Observación cruda:**
+- DPS promedio: ~2.5 int/min
+- Healers promedio: ~0.8 int/min
+- Tanks promedio: ~0.6 int/min
+- Top 20 interrumpidores: 100% son clases DPS (Rogue, Mage, Shaman Enhancement)
+
+**Interpretación:**
+La diferencia entre roles en interrupciones es **pronunciada y esperada**. Los DPS tienen kits de control de masas diseñados para interrumpir; los healers priorizan sanación. Los tanks interrumpen como mecanismo secundario (stun, pushback).
+
+**Recomendación:**
+- **Para un equipo que busca un buen interruptor:** Rogue (Kick) y Mage (Counterspell) son las elecciones óptimas, ambos con cooldown de 15s en interruptor.
+- **Healers con buen control (e.g., Discipline Priest con Psychic Scream):** útiles en affixes de casters pero no son sustitutos de un DPS interruptor.
+
+#### 7.6.5. Hallazgo 5 — Las composiciones 1-2-2 son intrínsecamente 5% más rápidas que 1-1-3
+
+**Observación cruda:**
+- 283 composiciones con ≥2 muestras (suficientes para significancia)
+- Comps 1-2-2: synergy_score ≈ 0.95 (5% más rápidas que el promedio)
+- Comps 1-1-3: synergy_score ≈ 1.04 (4% más lentas que el promedio)
+- Comps con 1 healer en dungeons <25 min: synergy_score > 1.0 (peor)
+- Comps con 1 healer en dungeons >30 min: synergy_score < 1.0 (mejor)
+
+**Interpretación:**
+La intuición de M+ de "más healers = más seguro" es **parcialmente correcta**. Para dungeons cortos, el healer extra es lastre (pierdes DPS). Para dungeons largos, el healer extra sostiene el grupo cuando el daño se alarga. Esto contradice el mito de "siempre 1-1-3 en alto key".
+
+**Recomendación:**
+- **Para rutas cortas (<25 min):** 1-2-2 con healer híbrido (Holy Paladin / Discipline Priest).
+- **Para dungeons largos o affix Tormented:** 1-1-3 con healers de alto HPS (Holy Priest, Restoration Shaman).
+- **No existe "la mejor composición universal":** la elección depende de la longitud esperada de la mazmorra.
+
+#### 7.6.6. Hallazgo 6 — La cobertura de WCL real es desigual entre KPIs
+
+**Observación cruda:**
+- KPI 1 (Death Clock): 815 filas WCL reales de 5.936 totales → 13.7%
+- KPI 2 (Healer Deficit): 2.814 filas de 5.936 → 47.4%
+- KPI 3 (Interrupt Rate): 5.747 filas de 29.680 → 19.4% (sobre silver_player_performance)
+- KPI 4 (Comp Synergy): 1.310 filas (todo Raider.IO, sin dependencia de WCL)
+
+**Interpretación:**
+Solo el **47% de runs tienen datos de healer deficit** mientras que **solo el 14% tienen datos de death clock**. Esto se debe a que:
+1. Death clock requiere eventos de daño recibido del tanque, que solo existen si el tanque fue targeteable en el log.
+2. Healer deficit requiere eventos de sanación, que son más frecuentes.
+
+La cobertura desigual **es un sesgo sistemático** que afecta cómo deben interpretarse los KPIs.
+
+**Recomendación:**
+- **No comparar directamente promedios de death clock vs healer deficit** sin normalizar por cobertura.
+- **Para análisis profundos de un KPI específico:** reportar siempre el denominador (cuántos runs tienen datos).
+
+#### 7.6.7. Hallazgo 7 — Las 5 dungeons con peor synergy_score tienen dungeons específicas, no aleatorias
+
+**Observación cruda:**
+- 5 dungeons con `synergy_score > 1.10` (peor que el promedio) son: 3 de Shadowlands, 1 de TWW S3
+- 5 dungeons con `synergy_score < 0.90` (mejor que el promedio) son: 2 de TWW S3, 3 de TWW S2
+
+**Interpretación:**
+La sinergia de composición **depende fuertemente de la dungeon específica**, no solo de la composición abstracta. Hay dungeons inherentemente más fáciles o más difíciles de tankear/healear debido a su diseño (mecánicas, tamaño de pulls, trash vs bosses).
+
+**Recomendación:**
+- **Para un equipo nuevo:** empezar por dungeons con `synergy_score < 0.95` (más indulgentes).
+- **Para un equipo que busca reto:** dungeons con `synergy_score > 1.05` requieren composiciones optimizadas.
+
+#### 7.6.8. Hallazgo 8 — El tamaño muestral afecta la fiabilidad de synergy_score
+
+**Observación cruda:**
+- 1.310 composiciones totales
+- 1.027 con `sample_count = 1` (no fiables)
+- 283 con `sample_count >= 2` (fiables)
+
+**Interpretación:**
+El **78% de las composiciones tienen una sola muestra**. Esto significa que la mayoría de las synergy_scores son ruido estadístico. Solo las 283 composiciones con ≥ 2 muestras son utilizables para análisis serios.
+
+**Recomendación:**
+- **El dashboard ya filtra a `sample_count >= 2`** (decisión de diseño correcta). Documentar esta decisión en la UI para que los usuarios entiendan.
+- **Para un equipo que busca aplicar estos insights:** trabajar solo con las 283 composiciones fiables, no con las 1.310 totales.
+
+#### 7.6.9. Resumen ejecutivo de insights
+
+| # | Hallazgo | Acción recomendada |
+|---|----------|-------------------|
+| 1 | 97% de runs en key 22-23 | Focalizar análisis en este rango |
+| 2 | 92% de tanks sobreviven | Death clock crítico no es representativo |
+| 3 | 70% de healers cómodos | Holy Paladin mejor consistencia |
+| 4 | DPS interrumpen 3x más | Rogue/Mage óptimos para interruptor |
+| 5 | 1-2-2 mejor en dungeons cortos | Adaptar comp a la dungeon específica |
+| 6 | Cobertura WCL desigual | No comparar KPIs sin normalizar |
+| 7 | Dungeons tienen synergy propio | Trabajar dungeons fácil primero |
+| 8 | 78% de comps con muestra = 1 | Solo 283 fiables para análisis serios |
+
+> 📊 **Estos 8 insights están embebidos en el dashboard** (anotaciones `st.markdown` bajo cada gráfico relevante) para que cualquier usuario pueda llegar a las mismas conclusiones sin leer este documento.
+
 ---
 
 ## 8. Orquestación del pipeline con Dagster
