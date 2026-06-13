@@ -17,12 +17,52 @@ Incluye un módulo de **Machine Learning** (Ridge regression) que predice `clear
 
 ## 🏗️ Arquitectura del Pipeline
 
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'lineColor': '#4a4a6a' }}}%%
+
+graph LR
+    subgraph EXTERNAL["☁️ Fuentes"]
+        RAIDERIO[Raider.IO API]
+        WCL[WarcraftLogs API]
+    end
+    subgraph BRONZE["🥉 Bronze"]
+        CHK[check_minio_state]
+        B_RIO[bronze_rio]
+        MATCH[match_manifest]
+        B_WCL[bronze_wcl]
+    end
+    subgraph SILVER["🥈 Silver"]
+        S_RIO[silver_raiderio]
+        S_RUNS[silver_dungeon_runs]
+        S_PP[silver_player_performance]
+    end
+    subgraph GOLD["🥇 Gold"]
+        DIM[dim_*<br/>4 dimensiones]
+        KPI[kpi_*<br/>4 KPIs]
+    end
+    subgraph ML["🤖 ML"]
+        FEAT[gold_features]
+        MODEL[ml_model<br/>Ridge]
+    end
+
+    RAIDERIO --> B_RIO
+    WCL --> B_WCL
+    CHK --> B_RIO
+    B_RIO --> S_RIO
+    B_RIO --> MATCH
+    MATCH --> B_WCL
+    S_RIO --> S_RUNS
+    B_WCL --> S_RUNS
+    S_RUNS --> S_PP
+    S_RIO --> DIM
+    S_PP --> KPI
+    S_RIO --> KPI
+    KPI --> FEAT
+    DIM --> FEAT
+    FEAT --> MODEL
 ```
-Raider.IO ──► Bronze ──► Silver ──► Match ──► WCL Events ──► Gold ──► ML ──► Predicción
-   API         Parquet     Clean +     3-Layer      DamageTaken   4 KPIs    Ridge   clear_time_seconds
-                           Dedup       Fuzzy Join   Healing       4 Dims    MLflow
-                                                     Interrupts
-```
+
+> 📐 **[Diagrama DAG completo](docs/diagrama-pipeline.md)** con todas las dependencias, tareas paralelas, y justificación de Spark.
 
 ### Capas implementadas
 
