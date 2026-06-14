@@ -133,7 +133,6 @@ _GOLD_KPI_RIOS = {
     "healer_deficit": "kpi_healer_deficit",
     "interrupt_rate": "kpi_interrupt_rate",
     "composition_synergy": "kpi_composition_synergy",
-    "role_flexibility": "kpi_role_flexibility",
 }
 
 
@@ -142,14 +141,14 @@ _GOLD_KPI_RIOS = {
     description="Average gold KPI ratio against silver_raiderio >= 80% (composite)",
 )
 def cr_silver_rio_to_gold_kpis_composite_check() -> dict:
-    """CR-4: composite of silver_raiderio -> all 5 gold KPIs.
+    """CR-4: composite of silver_raiderio -> all 4 gold KPIs.
 
-    Averages downstream/upstream ratio across all 5 gold KPIs to give
+    Averages downstream/upstream ratio across all 4 gold KPIs to give
     a single, more stable signal.  If individual KPIs (tank-only,
     healer-only) are sparse, the average smooths that out.
 
     Note: the user-facing check is attached to ``gold_kpi_death_clock``
-    as a representative gold KPI.  The composite covers all 5 KPIs
+    as a representative gold KPI.  The composite covers all 4 KPIs
     internally.
     """
     if not settings.CHECK_COMPLETENESS_ENABLED:
