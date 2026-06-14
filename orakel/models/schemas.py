@@ -342,3 +342,45 @@ dead_letter_schema = StructType(
         StructField("season", StringType(), nullable=False),
     ]
 )
+
+# ─── Additional Layer Schemas (SDD PR 2: cross-layer checks) ───────────────
+# ``silver_raiderio_schema`` and ``gold_features_schema`` are added in PR 2
+# to anchor the schema-drift wrappers in ``checks_schema.py``.  They mirror
+# the cleaning/feature-view steps in ``orakel.pipeline.silver`` and
+# ``orakel.ml.features`` respectively; any divergence from these
+# definitions is reported as a drift and propagates to the Dagster UI.
+
+silver_raiderio_schema = StructType(
+    [
+        StructField("keystone_run_id", LongType(), nullable=False),
+        StructField("dungeon_id", IntegerType(), nullable=False),
+        StructField("dungeon_name", StringType(), nullable=True),
+        StructField("mythic_level", IntegerType(), nullable=True),
+        StructField("clear_time_ms", LongType(), nullable=True),
+        StructField("keystone_time_ms", LongType(), nullable=True),
+        StructField("completed_at", TimestampType(), nullable=True),
+        StructField("score", DoubleType(), nullable=True),
+        StructField("rank", IntegerType(), nullable=True),
+        StructField("season", StringType(), nullable=False),
+    ]
+)
+
+# Minimal schema for the feature view.  The full schema is constructed
+# dynamically by ``orakel.ml.features.build_feature_view()``; this
+# definition only needs to be a stable superset for drift detection.
+# ``actual_fp == expected_fp`` only requires the column set and types
+# to match — superset mode tolerates new columns, but missing ones or
+# type changes are flagged.
+gold_features_schema = StructType(
+    [
+        StructField("run_id", StringType(), nullable=False),
+        StructField("dungeon_id", IntegerType(), nullable=True),
+        StructField("key_level", IntegerType(), nullable=True),
+        StructField("season", StringType(), nullable=False),
+        StructField("clear_time_seconds", DoubleType(), nullable=True),
+        StructField("death_clock_seconds", DoubleType(), nullable=True),
+        StructField("deficit_ratio", DoubleType(), nullable=True),
+        StructField("interrupts_per_minute", DoubleType(), nullable=True),
+        StructField("synergy_score", DoubleType(), nullable=True),
+    ]
+)
