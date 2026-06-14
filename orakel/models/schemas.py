@@ -1,4 +1,23 @@
-"""PySpark StructType schemas for all Medallion layers (Bronze/Silver/Gold)."""
+"""PySpark StructType schemas for all Medallion layers (Bronze/Silver/Gold).
+
+Type-consistency notes
+----------------------
+``dungeon_id`` is declared as ``IntegerType()`` consistently across every layer
+schema that contains it (verified for SDD change ``Verification Dagster
+Orchestation`` — task 1.1):
+
+  - ``bronze_raiderio_schema``            (line ~41, non-null)
+  - ``silver_dungeon_runs_schema``        (line ~144, non-null)
+  - ``gold_kpi_tank_death_clock_schema``  (line ~197, nullable)
+  - ``gold_kpi_composition_synergy_schema`` (line ~250, nullable)
+  - ``dim_dungeon_schema``                (line ~270, non-null)
+
+This means cross-layer joins on ``dungeon_id`` (Bronze -> Silver -> Gold KPI ->
+Dim) are type-safe without explicit casts.  Any future schema change that
+introduces a different type here MUST update this comment and the relevant
+AssetCheck (``check_referential_integrity`` wrappers in PR 2 will fail loud
+on a type mismatch).
+"""
 
 from __future__ import annotations
 
