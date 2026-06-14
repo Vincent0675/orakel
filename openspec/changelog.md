@@ -83,3 +83,26 @@
 - [`ingest_warcraftlogs.py`] **Interrupt Rate NULL**: Los eventos de interrupt se almacenaban sin `player_name`. Fix: obtener masterData del reporte (actor_id → player_name) y resolver sourceID antes de almacenar.
 - [`ingest_warcraftlogs.py`] **Interrupt fight_id=0**: Al usar `fight_ids[0]` en vez de iterar por fight, todos los eventos tenían fight_id=0 y no se vinculaban. Fix: iterar `for fid in fight_ids`.
 - [`silver.py`] **Interrupt join fallaba por capitalización**: Los nombres de jugadores de WCL no coincidían con los de Raider.IO por diferencias de mayúsculas. Fix: `F.lower()` en ambos lados del join.
+
+---
+
+## PR #3/#4 — Verification Dagster Orchestation (2026-06-14)
+
+### Archivos creados
+- `orakel/pipeline/assets/checks_referential.py` — 7 wrappers de integridad referencial entre capas
+- `orakel/pipeline/assets/checks_completeness.py` — 5 wrappers de ratio de completitud
+- `orakel/pipeline/assets/checks_schema.py` — 7 wrappers de detección de schema drift
+- `tests/test_pipeline/test_checks_cross_layer.py` — 27 tests para validación cruzada
+
+### Archivos modificados
+- `orakel/pipeline/assets/checks.py` — 3 funciones core reutilizables + 6 checks por asset
+- `orakel/pipeline/definitions.py` — Registro de 34 checks totales
+- `orakel/config.py` — 5 settings de configuración de checks
+- `orakel/models/schemas.py` — Documentación de consistencia de tipos
+
+### Impacto
+| Métrica | Antes | Después |
+|---------|-------|---------|
+| AssetChecks | 9 | 34 |
+| Tests | ~146 | ~198 |
+| Módulos de checks | 1 | 4 |

@@ -2,7 +2,7 @@
 
 > **Proyecto Integrador — Big Data + BI + Procesamiento + ML + Orquestación**
 
-[![Tests](https://img.shields.io/badge/tests-146_passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-198_passing-brightgreen)]()
 [![Coverage ML](https://img.shields.io/badge/coverage%20ML-93%25-brightgreen)]()
 [![Python 3.13](https://img.shields.io/badge/python-3.13-blue)]()
 [![Dagster](https://img.shields.io/badge/orquestación-Dagster-orange)]()
@@ -77,7 +77,7 @@ graph LR
 | ⑦ Almacenamiento final | ✅ | Gold layer en MinIO (Parquet) |
 | ⑧ Visualización BI | ✅ | Streamlit dashboard con 5 páginas, filtros, plotly |
 | ⑨ ML / Analítica | ✅ | Ridge regression con MLflow tracking y MinIO persistence |
-| ⑩ Orquestación | ✅ | Dagster con 17 software-defined assets |
+| ⑩ Orquestación | ✅ | Dagster con 17 SDAs y 34 AssetChecks |
 
 ---
 
@@ -134,7 +134,7 @@ orakel/ml/
 | **Procesamiento** | PySpark 4.x (Hadoop S3A) |
 | **Almacenamiento** | MinIO (S3-compatible) |
 | **Ingesta API** | Raider.IO REST + WarcraftLogs GraphQL |
-| **Orquestación** | Dagster 1.10+ (17 SDAs) |
+| **Orquestación** | Dagster 1.10+ (17 SDAs, 34 AssetChecks) |
 | **ML** | scikit-learn 1.9+ (Ridge) + MLflow 2.20+ |
 | **Dashboard** | Streamlit + Plotly Express |
 | **Tests** | pytest 9 + chispa (Tier 2) |
@@ -229,7 +229,7 @@ Las imágenes usan un **multi-stage build**: un stage de builder instala depende
 | `make run` | Levanta MinIO + MLflow + Dagster en background |
 | `make stop` | Detiene todos los servicios |
 | `make logs` | Muestra logs en vivo de los servicios |
-| `make test` | Corre la suite de tests (146 tests) |
+| `make test` | Corre la suite de tests (198 tests) |
 | `make test-fast` | Solo Tier 1 (sin Spark) |
 | `make coverage` | Reporte de cobertura HTML |
 | `make pipeline` | Ejecuta el pipeline completo (Dagster) |
@@ -294,7 +294,10 @@ orakel/
 │       ├── bronze.py
 │       ├── silver.py
 │       ├── gold.py
-│       └── checks.py
+│       ├── checks.py                # Core functions + per-asset checks
+│       ├── checks_referential.py    # Cross-layer referential integrity
+│       ├── checks_completeness.py   # Completeness ratio validation
+│       └── checks_schema.py         # Schema drift detection
 ├── ml/
 │   ├── schemas.py            # FEATURE_COLUMNS, TARGET_COLUMN
 │   ├── features.py           # build_feature_view() — Spark
@@ -306,9 +309,9 @@ orakel/
 ├── config.py                 # Settings desde .env
 ├── dashboard/
 │   └── app.py                # Streamlit BI dashboard
-├── tests/                    # 146 tests (Tier 1 + Tier 2)
+├── tests/                    # 198 tests (Tier 1 + Tier 2)
 ├── scripts/                  # Scripts de ingesta
-├── openspec/                 # Documentación SDD (2 cambios archivados)
+├── openspec/                 # Documentación SDD (3 cambios archivados)
 ├── docker-compose.yml        # MinIO service
 ├── Makefile                  # Comandos del proyecto
 ├── pyproject.toml
@@ -346,12 +349,12 @@ Flags disponibles: `--resume` (default), `--no-resume`, `--limit N`.
 # Todos los tests
 make test
 # o: uv run pytest tests/ -v
-# → 146 tests passed (68 Tier 1 + 7 Tier 2 ML + 71 pipeline)
+# → 198 tests passed (68 Tier 1 + 7 Tier 2 ML + 123 pipeline)
 
 # Solo Tier 1 (sin Spark, más rápido)
 make test-fast
 # o: uv run pytest tests/ -m "not spark" -v
-# → 139 tests passed
+# → 191 tests passed
 
 # Cobertura
 make coverage
@@ -364,7 +367,7 @@ make coverage
 |--------|:---------:|
 | `orakel/ml/` (ML module) | **93%** |
 | `orakel/clients/` | ~95% |
-| `orakel/pipeline/` | ~80% |
+| `orakel/pipeline/` | ~85% (incluye 34 AssetChecks) |
 | `orakel/models/` | ~85% |
 | `orakel/utils/` | ~90% |
 
@@ -393,7 +396,8 @@ Variables de entorno (`.env` desde `.env.example`):
 - [x] Pipeline completo Bronze → Silver → Gold
 - [x] ML module con Ridge regression
 - [x] Orquestación con Dagster
-- [x] Test suite (146 tests, 93% cobertura ML)
+- [x] Test suite (198 tests, 93% cobertura ML)
+- [x] Verificación con AssetChecks (integridad referencial, completitud, schema drift)
 - [x] README + Makefile
 - [ ] **Dockerización completa** — Dockerfile + compose con MinIO + MLflow + Dagster
 - [ ] **CI/CD** — GitHub Actions para tests automáticos

@@ -59,7 +59,7 @@ Desarrollar un pipeline de ingeniería y analítica de datos que integre dos fue
 | OE4 | Entrenar un modelo Ridge con métricas publicables (MAE, RMSE, R²) | ✅ (R² = 0.68) |
 | OE5 | Construir un dashboard de BI con Streamlit con visualizaciones y filtros | ✅ (5 páginas) |
 | OE6 | Orquestar el pipeline completo con un sistema de assets y dependencias | ✅ (Dagster, 17 SDAs) |
-| OE7 | Implementar la suite de pruebas con cobertura verificable | ✅ (146 tests, ML 93%) |
+| OE7 | Implementar la suite de pruebas con cobertura verificable | ✅ (198 tests, ML 93%) |
 
 ### 1.4. Alcance y restricciones
 
@@ -178,7 +178,10 @@ orakel/
 │       ├── bronze.py         # 4 assets: check_minio_state, bronze_rio, match_manifest, bronze_wcl
 │       ├── silver.py         # 3 assets: silver_raiderio, silver_dungeon_runs, silver_player_performance
 │       ├── gold.py           # 9 assets: 4 dimensiones + 4 KPIs + gold_features + ml_model
-│       └── checks.py         # 9 asset checks (validaciones)
+│       ├── checks.py                # 3 funciones core + 6 checks por asset
+│       ├── checks_referential.py    # 7 checks de integridad referencial
+│       ├── checks_completeness.py   # 5 checks de ratio de completitud
+│       └── checks_schema.py         # 7 checks de schema drift
 ├── ml/                       # Módulo de Machine Learning
 │   ├── schemas.py            # FEATURE_COLUMNS, TARGET_COLUMN, AFFIX_COLUMNS, DUNGEON_COLUMNS
 │   ├── features.py           # build_feature_view() — feature engineering en Spark
@@ -190,7 +193,7 @@ orakel/
 ├── dashboard/
 │   └── app.py                # Streamlit BI dashboard (5 páginas)
 ├── config.py                 # Settings desde .env
-├── tests/                    # 146 tests (Tier 1 + Tier 2)
+├── tests/                    # 198 tests (Tier 1 + Tier 2)
 ├── scripts/                  # Scripts ejecutables de ingesta
 ├── docs/                     # Memoria técnica, diagramas
 ├── openspec/                 # Specs SDD (2 cambios archivados)
@@ -1324,7 +1327,11 @@ graph TD
 
 ### 8.4. Asset checks (validaciones)
 
-Además de los assets, declaramos **9 asset checks** que validan invariantes de calidad:
+Además de los assets, declaramos **34 asset checks** distribuidos en 4 módulos que validan invariantes de calidad en múltiples niveles:
+
+#### 8.4.1. Core (6 checks) — `checks.py`
+
+Funciones reutilizables (`check_row_count`, `check_null_pct`, `check_unique_keys`) aplicadas a 6 assets principales:
 
 | Check | Asset | Validación |
 |-------|-------|------------|
@@ -1338,7 +1345,19 @@ Además de los assets, declaramos **9 asset checks** que validan invariantes de 
 | `gold_kpi_synergy_check` | `kpi_synergy` | ratios positivos |
 | `gold_features_check` | `gold_features` | todas las features existen, no-NaN |
 
-Los asset checks se ejecutan **después** de cada asset y bloquean el asset downstream si fallan.
+#### 8.4.2. Referential integrity (7 checks) — `checks_referential.py`
+
+Verifica la **trazabilidad de `run_id` entre capas**: que cada run presente en Silver exista en Bronze, que cada KPI en Gold corresponda a un run válido en Silver, y que el fuzzy join haya preservado la cardinalidad esperada.
+
+#### 8.4.3. Completeness ratio (5 checks) — `checks_completeness.py`
+
+Valida **ratios de completitud entre capas**: porcentaje de runs Bronze que llegan a Silver, porcentaje de runs Silver con datos WCL enriquecidos, porcentaje de filas Gold con KPIs no-NULL. Detecta caídas abruptas en la cobertura entre capas.
+
+#### 8.4.4. Schema drift (7 checks) — `checks_schema.py`
+
+Detecta **cambios de schema** comparando el `StructType` esperado (declarado en `orakel/models/schemas.py`) contra el schema real de los Parquet en MinIO. Falla el check si una columna nueva desaparece, cambia de tipo, o aparece una columna inesperada.
+
+Los asset checks se ejecutan **después** de cada asset y bloquean el asset downstream si fallan. Cada check es **toggleable** vía settings en `config.py` (`CHECK_*_ENABLED`), lo que permite deshabilitar validaciones específicas en entornos de desarrollo sin tocar el código.
 
 ### 8.5. Schedule
 
@@ -1398,9 +1417,9 @@ Los tests Tier 2 están marcados con `@pytest.mark.spark` y excluidos por defect
 | `tests/test_clients/` (Raider.IO + WCL) | ~28 | 95% |
 | `tests/test_models/` (kpi.py, schemas) | ~17 | 90% |
 | `tests/test_utils/` (rate_limiter, minio) | ~12 | 95% |
-| `tests/test_pipeline/` (bronze, silver, gold) | ~14 | 80% |
+| `tests/test_pipeline/` (bronze, silver, gold, checks) | ~66 | 85% |
 | `tests/test_ml/` (schemas, trainer, predict, features) | 75 | 93% |
-| **Total** | **146** | ~50% (global), **93% ML** |
+| **Total** | **~198** | ~50% (global), **93% ML** |
 
 ### 9.3. Cobertura por módulo
 
@@ -1496,12 +1515,12 @@ Usamos `np.random.default_rng(seed)` con seed fijo para que los datos sean **rep
 # Suite completa (Tier 1 + Tier 2)
 make test
 # o: uv run pytest tests/ -v
-# → 146 tests, ~25 segundos
+# → ~198 tests, ~25 segundos
 
 # Solo Tier 1 (sin Spark, más rápido)
 make test-fast
 # o: uv run pytest tests/ -m "not spark" -v
-# → 139 tests, ~5 segundos
+# → ~191 tests, ~5 segundos
 
 # Reporte de cobertura HTML
 make coverage
@@ -1513,7 +1532,7 @@ make coverage
 
 | Métrica | Valor | Target | Estado |
 |---------|:-----:|:------:|:------:|
-| Tests totales | 146 | ≥100 | ✅ |
+| Tests totales | 198 | ≥100 | ✅ |
 | Cobertura ML | 93% | ≥80% | ✅ |
 | Cobertura global | ~50% | ≥60% | ⚠️ |
 | Tests flaky | 0 | 0 | ✅ |
@@ -1954,13 +1973,13 @@ orakel/
 | Métrica | Valor |
 |---------|:-----:|
 | Líneas de código Python | ~13.000 |
-| Tests | 146 |
+| Tests | 198 |
 | Cobertura ML | 93% |
 | Cobertura global | ~50% |
 | Archivos en el repo | ~80 |
 | Commits en `main` | 70+ |
 | Assets de Dagster | 17 |
-| Asset checks | 9 |
+| Asset checks | 34 |
 | KPIs de negocio | 4 |
 | Páginas del dashboard | 5 |
 | Fuentes externas integradas | 2 (Raider.IO + WCL) |

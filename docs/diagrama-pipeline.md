@@ -102,17 +102,12 @@ graph TD
   end
 
   %% ─── Asset Checks ───
-  subgraph CHECKS["✅ Asset Checks (Validaciones)"]
+  subgraph CHECKS["✅ Asset Checks (34 checks)"]
     direction TB
-    C_BRONZE["bronze_rio_checks"]:::check
-    C_SR["silver_raiderio_checks"]:::check
-    C_SDR["silver_dungeon_runs_checks"]:::check
-    C_SPP["silver_player_performance_checks"]:::check
-    C_KDC["gold_kpi_death_clock_check"]:::check
-    C_KHD["gold_kpi_healer_deficit_check"]:::check
-    C_KIR["gold_kpi_interrupt_rate_check"]:::check
-    C_KSY["gold_kpi_synergy_check"]:::check
-    C_GF["gold_features_check"]:::check
+    C_CORE["Core (6)<br/>row-count per asset"]:::check
+    C_RI["Referential Integrity (7)<br/>cross-layer traceability"]:::check
+    C_CR["Completeness Ratio (5)<br/>layer-to-layer ratios"]:::check
+    C_SD["Schema Drift (7)<br/>Parquet vs StructType"]:::check
   end
 
   %% ─── Connections to external sources ───
@@ -136,16 +131,16 @@ graph TD
   FEATURES -.-> MINIO_GOLD
   MODEL -.-> MINIO_MODEL
 
-  %% ─── Connections from assets to checks ───
-  BRONZE_RIO -.- C_BRONZE
-  SILVER_RIO -.- C_SR
-  SILVER_RUNS -.- C_SDR
-  SILVER_PP -.- C_SPP
-  KPI_DC -.- C_KDC
-  KPI_HD -.- C_KHD
-  KPI_IR -.- C_KIR
-  KPI_SY -.- C_KSY
-  FEATURES -.- C_GF
+  %% ─── Connections from assets to checks (conceptual) ───
+  BRONZE_RIO -.-> C_CORE
+  SILVER_RIO -.-> C_CORE
+  SILVER_RUNS -.-> C_CORE
+  SILVER_PP -.-> C_CORE
+  KPI_DC -.-> C_CORE
+  KPI_HD -.-> C_CORE
+  KPI_IR -.-> C_CORE
+  KPI_SY -.-> C_CORE
+  FEATURES -.-> C_CORE
 
   %% ─── Styles ───
   classDef external fill:#e94560,color:#fff,stroke:#c73e54,stroke-width:2px
