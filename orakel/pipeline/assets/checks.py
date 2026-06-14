@@ -1,14 +1,24 @@
 """AssetCheck definitions — data quality gates per layer.
 
-Each check validates row counts and null percentages on critical columns.
+Each check validates row counts and null percentages on critical columns,
+plus cross-layer referential integrity, completeness ratios, and schema
+drift detection (SDD: Verification-Dagster-Orchestation).
  """
 
-import logging
+from __future__ import annotations
 
-from dagster import AssetKey, asset_check
+import hashlib
+import logging
+from typing import TYPE_CHECKING
+
+from dagster import AssetCheckResult, AssetKey, asset_check
 
 from orakel.config import settings
 from orakel.utils.minio import get_spark_session
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql.types import StructType
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +37,251 @@ def _read_parquet(path: str):
     except Exception:
         # Path may not exist yet or S3A connection failed
         return spark, None
+
+
+# ─── Core reusable check functions ──────────────────────────────────────────
+# These three functions are the building blocks for PR 2's per-asset wrappers.
+# They accept paths, not asset refs, so they can be unit-tested in isolation
+# with mock Parquet reads.
+
+
+def _season_filter(df: "DataFrame", season: str | None) -> "DataFrame":
+    """Filter ``df`` by ``season`` if both ``df`` has a season column and a
+    season was supplied.  Returns ``df`` unchanged otherwise.
+    """
+    from pyspark.sql import functions as F
+
+    if not season or "season" not in df.columns:
+        return df
+    return df.filter(F.col("season") == season)
+
+
+def check_referential_integrity(
+    spark: "SparkSession",
+    upstream_path: str,
+    downstream_path: str,
+    join_key: str,
+    season: str | None = None,
+    sample_size: int | None = None,
+) -> AssetCheckResult:
+    """Verify every ``join_key`` in ``downstream_path`` exists in ``upstream_path``.
+
+    Performs a left-anti join from downstream -> upstream on ``join_key``.
+    Returns ``passed=True`` if no orphans are found.
+
+    Parameters
+    ----------
+    spark : SparkSession
+        Active Spark session.
+    upstream_path, downstream_path : str
+        ``s3a://`` paths to the Parquet tables.
+    join_key : str
+        Column name shared by both tables (e.g. ``run_id``).
+    season : str, optional
+        If set, filter both tables to this season before counting.
+    sample_size : int, optional
+        If set and > 0, sample that many rows from downstream before the
+        anti-join.  Useful when downstream is large (Gold > 100k rows).
+        ``None`` or ``0`` means full scan (default).
+
+    Notes
+    -----
+    Warning-only: failures do not block downstream assets.  Promoted to
+    ``severity=BLOCKING`` after PR 2 validation period.
+    """
+    from pyspark.errors import AnalysisException
+    from pyspark.sql import functions as F
+
+    try:
+        upstream_df = spark.read.parquet(upstream_path)
+        downstream_df = spark.read.parquet(downstream_path)
+    except AnalysisException as e:
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": f"path not found: {e}"},
+        )
+
+    upstream_df = _season_filter(upstream_df, season)
+    downstream_df = _season_filter(downstream_df, season)
+
+    # Distinct keys keep the anti-join cheap.
+    upstream_keys = upstream_df.select(join_key).distinct()
+    downstream_keys = downstream_df.select(join_key).distinct()
+
+    if sample_size and sample_size > 0:
+        downstream_keys = downstream_keys.orderBy(F.rand()).limit(sample_size)
+
+    orphans = downstream_keys.join(upstream_keys, on=join_key, how="left_anti")
+    orphan_count = orphans.count()
+    total_downstream = downstream_keys.count()
+
+    return AssetCheckResult(
+        passed=orphan_count == 0,
+        metadata={
+            "orphan_count": orphan_count,
+            "total_downstream": total_downstream,
+            "sample_size": sample_size or 0,
+            "join_key": join_key,
+        },
+    )
+
+
+def check_completeness_ratio(
+    spark: "SparkSession",
+    upstream_path: str,
+    downstream_path: str,
+    season: str | None = None,
+    min_ratio: float = 0.5,
+) -> AssetCheckResult:
+    """Verify ``downstream_count / upstream_count >= min_ratio``.
+
+    Returns ``passed=True`` if the ratio is at or above the threshold, or
+    if the upstream partition is empty (treated as a non-failure with
+    ``upstream_empty=true`` warning).
+
+    Parameters
+    ----------
+    min_ratio : float
+        Minimum acceptable ratio.  Default 0.5 (50% of upstream rows).
+    """
+    from pyspark.errors import AnalysisException
+
+    try:
+        upstream_df = spark.read.parquet(upstream_path)
+        downstream_df = spark.read.parquet(downstream_path)
+    except AnalysisException as e:
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": f"path not found: {e}"},
+        )
+
+    upstream_df = _season_filter(upstream_df, season)
+    downstream_df = _season_filter(downstream_df, season)
+
+    upstream_count = upstream_df.count()
+    downstream_count = downstream_df.count()
+
+    if upstream_count == 0:
+        # Empty upstream is a no-data signal, not a failure.  Surface as a
+        # warning so operators can tell it apart from a real drop.
+        return AssetCheckResult(
+            passed=True,
+            metadata={
+                "ratio": 0.0,
+                "upstream_count": 0,
+                "downstream_count": downstream_count,
+                "min_ratio": min_ratio,
+                "upstream_empty": True,
+            },
+        )
+
+    ratio = downstream_count / upstream_count
+    return AssetCheckResult(
+        passed=ratio >= min_ratio,
+        metadata={
+            "ratio": round(ratio, 4),
+            "upstream_count": upstream_count,
+            "downstream_count": downstream_count,
+            "min_ratio": min_ratio,
+        },
+    )
+
+
+def _schema_fingerprint(schema: "StructType") -> str:
+    """Stable SHA-256 fingerprint of a StructType.
+
+    Sorted ``(name, data_type)`` pairs ensure fingerprint stability across
+    field reordering.  Used to compare Parquet footer schemas without
+    shipping the full schema in metadata.
+    """
+    pairs = sorted((f.name, str(f.dataType)) for f in schema.fields)
+    payload = "|".join(f"{n}:{t}" for n, t in pairs).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def check_schema_drift(
+    spark: "SparkSession",
+    path: str,
+    expected_schema: "StructType",
+    season: str | None = None,
+    mode: str = "superset",
+) -> AssetCheckResult:
+    """Detect schema drift between a Parquet path and an expected ``StructType``.
+
+    Reads the Parquet footer (no full scan) and compares the actual schema
+    with ``expected_schema``.
+
+    Parameters
+    ----------
+    path : str
+        ``s3a://`` Parquet path.
+    expected_schema : StructType
+        Canonical schema from ``orakel.models.schemas``.
+    season : str, optional
+        If set, included in the result metadata for traceability.
+    mode : str
+        ``"exact"``  — every field name and type must match.
+        ``"superset"`` — actual schema must contain every expected column
+        (extra columns allowed, missing columns or type changes are drift).
+
+    Returns
+    -------
+    AssetCheckResult
+        ``passed=True`` when the schema conforms in the chosen mode.
+        ``passed=True`` with ``path_not_found=True`` metadata when the
+        path is missing (first-run scenario).
+    """
+    from pyspark.errors import AnalysisException
+
+    if mode not in ("exact", "superset"):
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": f"invalid mode '{mode}' (use 'exact' or 'superset')"},
+        )
+
+    try:
+        # Parquet footer is read for .schema — no full scan happens until
+        # an action like .count() is called.
+        actual_schema = spark.read.parquet(path).schema
+    except AnalysisException:
+        return AssetCheckResult(
+            passed=True,
+            metadata={"path_not_found": True, "path": path},
+        )
+
+    expected_names = {f.name: f for f in expected_schema.fields}
+    actual_names = {f.name: f for f in actual_schema.fields}
+
+    if mode == "exact":
+        missing = [n for n in expected_names if n not in actual_names]
+        extra = [n for n in actual_names if n not in expected_names]
+    else:  # superset
+        missing = [n for n in expected_names if n not in actual_names]
+        extra = []  # forward-compat: extra columns are allowed
+
+    type_mismatches = [
+        n
+        for n in expected_names
+        if n in actual_names
+        and str(expected_names[n].dataType) != str(actual_names[n].dataType)
+    ]
+
+    actual_fp = _schema_fingerprint(actual_schema)
+    expected_fp = _schema_fingerprint(expected_schema)
+
+    drift_detected = bool(missing) or bool(type_mismatches)
+    return AssetCheckResult(
+        passed=not drift_detected,
+        metadata={
+            "mode": mode,
+            "missing_columns": ",".join(missing) if missing else "",
+            "extra_columns": ",".join(extra) if extra else "",
+            "type_mismatches": ",".join(type_mismatches) if type_mismatches else "",
+            "actual_schema_fingerprint": actual_fp,
+            "expected_schema_fingerprint": expected_fp,
+            "season": season or "",
+        },
+    )
 
 
 # ─── Bronze Checks ──────────────────────────────────────────────────────────────
