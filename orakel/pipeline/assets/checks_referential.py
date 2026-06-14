@@ -32,31 +32,31 @@ from dagster import AssetCheckResult, AssetKey, asset_check
 
 from orakel.config import settings
 from orakel.pipeline.assets.checks import check_referential_integrity
-from orakel.utils.minio import get_spark_session
 
 logger = logging.getLogger(__name__)
 
 
 def _run_ri(
+    spark,
     upstream_path: str,
     downstream_path: str,
     join_key: str,
     sample_size: int | None = None,
     season: str | None = None,
 ) -> AssetCheckResult:
-    """Acquire a SparkSession, run the RI check, and tear down."""
-    spark = get_spark_session("ri_check")
-    try:
-        return check_referential_integrity(
-            spark,
-            upstream_path=upstream_path,
-            downstream_path=downstream_path,
-            join_key=join_key,
-            season=season or settings.SEASON,
-            sample_size=sample_size or settings.CHECK_RI_SAMPLE_SIZE,
-        )
-    finally:
-        spark.stop()
+    """Run the referential-integrity check using the caller-supplied SparkSession.
+
+    ``spark`` is provided by the Dagster ``spark_resource`` so this helper
+    no longer creates or tears down a session of its own.
+    """
+    return check_referential_integrity(
+        spark,
+        upstream_path=upstream_path,
+        downstream_path=downstream_path,
+        join_key=join_key,
+        season=season or settings.SEASON,
+        sample_size=sample_size or settings.CHECK_RI_SAMPLE_SIZE,
+    )
 
 
 # ─── RI-1: silver_raiderio -> bronze_rio (keystone_run_id) ───────────────────
@@ -65,8 +65,9 @@ def _run_ri(
 @asset_check(
     asset=AssetKey(["orakel", "silver_raiderio"]),
     description="silver_raiderio.run_id must exist in bronze_rio.keystone_run_id",
+    required_resource_keys={"spark"},
 )
-def ri_silver_raiderio_to_bronze_check() -> dict:
+def ri_silver_raiderio_to_bronze_check(context) -> dict:
     """RI-1: silver_raiderio -> bronze_rio on keystone_run_id.
 
     Bronze is small — full scan (no sampling).
@@ -77,6 +78,7 @@ def ri_silver_raiderio_to_bronze_check() -> dict:
             metadata={"disabled": True, "join_key": "keystone_run_id"},
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs",
         join_key="keystone_run_id",
@@ -89,8 +91,9 @@ def ri_silver_raiderio_to_bronze_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_dungeon_runs"]),
     description="silver_dungeon_runs.rio_run_id must exist in bronze_rio.keystone_run_id",
+    required_resource_keys={"spark"},
 )
-def ri_silver_dungeon_runs_to_bronze_check() -> dict:
+def ri_silver_dungeon_runs_to_bronze_check(context) -> dict:
     """RI-2: silver_dungeon_runs -> bronze_rio on keystone_run_id.
 
     Joins on ``rio_run_id`` (silver) which is the cast/long-form of
@@ -103,6 +106,7 @@ def ri_silver_dungeon_runs_to_bronze_check() -> dict:
             metadata={"disabled": True, "join_key": "keystone_run_id"},
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         join_key="keystone_run_id",
@@ -128,14 +132,16 @@ _GOLD_KPI_PATHS = {
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_death_clock"]),
     description="gold_kpi_death_clock.run_id must exist in silver_dungeon_runs.run_id",
+    required_resource_keys={"spark"},
 )
-def ri_gold_kpi_death_clock_check() -> dict:
+def ri_gold_kpi_death_clock_check(context) -> dict:
     """RI-3a: gold_kpi_death_clock -> silver_dungeon_runs on run_id."""
     if not settings.CHECK_RI_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "join_key": "run_id"}
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/{_GOLD_KPI_PATHS['death_clock']}",
         join_key="run_id",
@@ -145,14 +151,16 @@ def ri_gold_kpi_death_clock_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_healer_deficit"]),
     description="gold_kpi_healer_deficit.run_id must exist in silver_player_performance.run_id",
+    required_resource_keys={"spark"},
 )
-def ri_gold_kpi_healer_deficit_check() -> dict:
+def ri_gold_kpi_healer_deficit_check(context) -> dict:
     """RI-3b: gold_kpi_healer_deficit -> silver_player_performance on run_id."""
     if not settings.CHECK_RI_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "join_key": "run_id"}
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/player_performance",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/{_GOLD_KPI_PATHS['healer_deficit']}",
         join_key="run_id",
@@ -162,8 +170,9 @@ def ri_gold_kpi_healer_deficit_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_interrupt_rate"]),
     description="gold_kpi_interrupt_rate.run_id must exist in silver_player_performance.run_id",
+    required_resource_keys={"spark"},
 )
-def ri_gold_kpi_interrupt_rate_check() -> dict:
+def ri_gold_kpi_interrupt_rate_check(context) -> dict:
     """RI-3c: gold_kpi_interrupt_rate -> silver_player_performance on run_id.
 
     Included per spec table line 13 (SDD: Verification-Dagster-Orchestation).
@@ -173,6 +182,7 @@ def ri_gold_kpi_interrupt_rate_check() -> dict:
             passed=True, metadata={"disabled": True, "join_key": "run_id"}
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/player_performance",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/{_GOLD_KPI_PATHS['interrupt_rate']}",
         join_key="run_id",
@@ -185,8 +195,9 @@ def ri_gold_kpi_interrupt_rate_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_features"]),
     description="gold_features.run_id must exist in silver_dungeon_runs.run_id",
+    required_resource_keys={"spark"},
 )
-def ri_gold_features_to_silver_check() -> dict:
+def ri_gold_features_to_silver_check(context) -> dict:
     """RI-4: gold_features -> silver_dungeon_runs on run_id.
 
     Note: gold_features is an ML artifact, but its run_id propagation is
@@ -198,6 +209,7 @@ def ri_gold_features_to_silver_check() -> dict:
             passed=True, metadata={"disabled": True, "join_key": "run_id"}
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/features",
         join_key="run_id",
@@ -210,8 +222,9 @@ def ri_gold_features_to_silver_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_dim_dungeon"]),
     description="gold_dim_dungeon.dungeon_id must exist in silver_dungeon_runs.dungeon_id",
+    required_resource_keys={"spark"},
 )
-def ri_gold_dim_dungeon_to_silver_check() -> dict:
+def ri_gold_dim_dungeon_to_silver_check(context) -> dict:
     """RI-5: gold_dim_dungeon -> silver_dungeon_runs on dungeon_id.
 
     Dim table is small — full scan.  Spark auto-broadcasts the join
@@ -222,6 +235,7 @@ def ri_gold_dim_dungeon_to_silver_check() -> dict:
             passed=True, metadata={"disabled": True, "join_key": "dungeon_id"}
         )
     return _run_ri(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/dim_dungeon",
         join_key="dungeon_id",

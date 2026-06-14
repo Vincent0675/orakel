@@ -14,29 +14,12 @@ from typing import TYPE_CHECKING
 from dagster import AssetCheckResult, AssetKey, asset_check
 
 from orakel.config import settings
-from orakel.utils.minio import get_spark_session
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql.types import StructType
 
 logger = logging.getLogger(__name__)
-
-
-def _read_parquet(path: str):
-    """Read a Parquet path from MinIO and return (spark, df) or (spark, None)."""
-    from pyspark.errors import AnalysisException
-
-    spark = get_spark_session("asset_check")
-    try:
-        df = spark.read.parquet(path)
-        return spark, df
-    except AnalysisException:
-        logger.warning("Path %s does not exist — check will return warning.", path)
-        return spark, None
-    except Exception:
-        # Path may not exist yet or S3A connection failed
-        return spark, None
 
 
 # ─── Core reusable check functions ──────────────────────────────────────────
@@ -290,48 +273,40 @@ def check_schema_drift(
 @asset_check(
     asset=AssetKey(["orakel", "bronze_rio"]),
     description="Bronze Raider.IO: row_count >= 1, null % on keystone_run_id < 1%",
+    required_resource_keys={"spark"},
 )
-def bronze_rio_checks() -> dict:
+def bronze_rio_checks(context) -> dict:
     """Check bronze_rio data quality."""
-    spark = get_spark_session("check_bronze_rio")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs"
-        try:
-            df = spark.read.parquet(path).filter(
-                __import__("pyspark.sql.functions", fromlist=["col"]).col("season") == settings.SEASON
-            )
-        except Exception:
-            from dagster import AssetCheckResult
-
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Bronze Raider.IO data not found"},
-            )
-
-        row_count = df.count()
-        if row_count < 1:
-            from dagster import AssetCheckResult
-
-            return AssetCheckResult(
-                passed=False,
-                metadata={"row_count": row_count, "error": "Expected >= 1 row"},
-            )
-
-        # Check null % on keystone_run_id
-        null_count = df.filter(df["keystone_run_id"].isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
-        from dagster import AssetCheckResult
-
-        return AssetCheckResult(
-            passed=null_pct < 0.01,
-            metadata={
-                "row_count": row_count,
-                "null_pct_keystone_run_id": f"{null_pct:.4f}",
-            },
+        df = spark.read.parquet(path).filter(
+            __import__("pyspark.sql.functions", fromlist=["col"]).col("season") == settings.SEASON
         )
-    finally:
-        spark.stop()
+    except Exception:
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": "Bronze Raider.IO data not found"},
+        )
+
+    row_count = df.count()
+    if row_count < 1:
+        return AssetCheckResult(
+            passed=False,
+            metadata={"row_count": row_count, "error": "Expected >= 1 row"},
+        )
+
+    # Check null % on keystone_run_id
+    null_count = df.filter(df["keystone_run_id"].isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=null_pct < 0.01,
+        metadata={
+            "row_count": row_count,
+            "null_pct_keystone_run_id": f"{null_pct:.4f}",
+        },
+    )
 
 
 # ─── Silver Checks ──────────────────────────────────────────────────────────────
@@ -340,96 +315,90 @@ def bronze_rio_checks() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_raiderio"]),
     description="Silver Raider.IO: row_count >= 1",
+    required_resource_keys={"spark"},
 )
-def silver_raiderio_checks() -> dict:
+def silver_raiderio_checks(context) -> dict:
     """Check silver_raiderio data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_silver_raiderio")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
-        try:
-            df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Silver Raider.IO data not found"},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 1,
-            metadata={"row_count": row_count},
+            passed=False,
+            metadata={"error": "Silver Raider.IO data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 1,
+        metadata={"row_count": row_count},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "silver_dungeon_runs"]),
     description="Silver dungeon_runs: row_count >= 1, no null dungeon_id",
+    required_resource_keys={"spark"},
 )
-def silver_dungeon_runs_checks() -> dict:
+def silver_dungeon_runs_checks(context) -> dict:
     """Check silver_dungeon_runs data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_silver_dungeon_runs")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs"
-        try:
-            df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Silver dungeon_runs data not found"},
-            )
-
-        row_count = df.count()
-        null_dungeon_id = df.filter(F.col("dungeon_id").isNull()).count()
-
+        df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 1 and null_dungeon_id == 0),
-            metadata={
-                "row_count": row_count,
-                "null_dungeon_id_count": null_dungeon_id,
-            },
+            passed=False,
+            metadata={"error": "Silver dungeon_runs data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    null_dungeon_id = df.filter(F.col("dungeon_id").isNull()).count()
+
+    return AssetCheckResult(
+        passed=(row_count >= 1 and null_dungeon_id == 0),
+        metadata={
+            "row_count": row_count,
+            "null_dungeon_id_count": null_dungeon_id,
+        },
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "silver_player_performance"]),
     description="Silver player_performance: row_count >= 5",
+    required_resource_keys={"spark"},
 )
-def silver_player_performance_checks() -> dict:
+def silver_player_performance_checks(context) -> dict:
     """Check silver_player_performance data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_silver_player_perf")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/silver/player_performance"
-        try:
-            df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Silver player_performance data not found"},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 5,
-            metadata={"row_count": row_count},
+            passed=False,
+            metadata={"error": "Silver player_performance data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 5,
+        metadata={"row_count": row_count},
+    )
 
 
 # ─── Gold KPI Checks ────────────────────────────────────────────────────────────
@@ -438,109 +407,103 @@ def silver_player_performance_checks() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_death_clock"]),
     description="Gold KPI death_clock: row_count >= 1, null % on primary metric < 50%",
+    required_resource_keys={"spark"},
 )
-def gold_kpi_death_clock_check() -> dict:
+def gold_kpi_death_clock_check(context) -> dict:
     """Check gold_kpi_death_clock data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_gold_kpi_death_clock")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_tank_death_clock"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold KPI death_clock data not found"},
-            )
-
-        row_count = df.count()
-        null_count = df.filter(F.col("death_clock_seconds").isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 1 and null_pct < 0.5),
-            metadata={
-                "row_count": row_count,
-                "null_pct_death_clock_seconds": f"{null_pct:.4f}",
-            },
+            passed=False,
+            metadata={"error": "Gold KPI death_clock data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    null_count = df.filter(F.col("death_clock_seconds").isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=(row_count >= 1 and null_pct < 0.5),
+        metadata={
+            "row_count": row_count,
+            "null_pct_death_clock_seconds": f"{null_pct:.4f}",
+        },
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_healer_deficit"]),
     description="Gold KPI healer_deficit: row_count >= 1, null % on primary metric < 50%",
+    required_resource_keys={"spark"},
 )
-def gold_kpi_healer_deficit_check() -> dict:
+def gold_kpi_healer_deficit_check(context) -> dict:
     """Check gold_kpi_healer_deficit data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_gold_kpi_healer_deficit")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_healer_deficit"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold KPI healer_deficit data not found"},
-            )
-
-        row_count = df.count()
-        null_count = df.filter(F.col("deficit_ratio").isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 1 and null_pct < 0.5),
-            metadata={
-                "row_count": row_count,
-                "null_pct_deficit_ratio": f"{null_pct:.4f}",
-            },
+            passed=False,
+            metadata={"error": "Gold KPI healer_deficit data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    null_count = df.filter(F.col("deficit_ratio").isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=(row_count >= 1 and null_pct < 0.5),
+        metadata={
+            "row_count": row_count,
+            "null_pct_deficit_ratio": f"{null_pct:.4f}",
+        },
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_interrupt_rate"]),
     description="Gold KPI interrupt_rate: row_count >= 1, null % on primary metric < 50%",
+    required_resource_keys={"spark"},
 )
-def gold_kpi_interrupt_rate_check() -> dict:
+def gold_kpi_interrupt_rate_check(context) -> dict:
     """Check gold_kpi_interrupt_rate data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_gold_kpi_interrupt_rate")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_interrupt_rate"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold KPI interrupt_rate data not found"},
-            )
-
-        row_count = df.count()
-        null_count = df.filter(F.col("interrupts_per_minute").isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 1 and null_pct < 0.5),
-            metadata={
-                "row_count": row_count,
-                "null_pct_interrupts_per_minute": f"{null_pct:.4f}",
-            },
+            passed=False,
+            metadata={"error": "Gold KPI interrupt_rate data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    null_count = df.filter(F.col("interrupts_per_minute").isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=(row_count >= 1 and null_pct < 0.5),
+        metadata={
+            "row_count": row_count,
+            "null_pct_interrupts_per_minute": f"{null_pct:.4f}",
+        },
+    )
 
 
 # ─── Gold Features Check (placeholder for PR2) ──────────────────────────────────
@@ -549,37 +512,35 @@ def gold_kpi_interrupt_rate_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_synergy"]),
     description="Gold KPI synergy: row_count >= 1, null % on primary metric < 50%",
+    required_resource_keys={"spark"},
 )
-def gold_kpi_synergy_check() -> dict:
+def gold_kpi_synergy_check(context) -> dict:
     """Check gold_kpi_synergy data quality."""
     from pyspark.sql import functions as F
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_gold_kpi_synergy")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_composition_synergy"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/kpi_composition_synergy"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold KPI synergy data not found"},
-            )
-
-        row_count = df.count()
-        null_count = df.filter(F.col("synergy_score").isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 1 and null_pct < 0.5),
-            metadata={
-                "row_count": row_count,
-                "null_pct_synergy_score": f"{null_pct:.4f}",
-            },
+            passed=False,
+            metadata={"error": "Gold KPI synergy data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    null_count = df.filter(F.col("synergy_score").isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=(row_count >= 1 and null_pct < 0.5),
+        metadata={
+            "row_count": row_count,
+            "null_pct_synergy_score": f"{null_pct:.4f}",
+        },
+    )
 
 
 # gold_features check will be added in PR2 (ML Training) when the asset exists
@@ -589,8 +550,9 @@ def gold_kpi_synergy_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_features"]),
     description="Gold features: row_count >= 10, no null clear_time_seconds",
+    required_resource_keys={"spark"},
 )
-def gold_features_check() -> dict:
+def gold_features_check(context) -> dict:
     """Check gold_features data quality.
 
     Validates that the feature view has at least 10 rows and no NULL values
@@ -600,37 +562,34 @@ def gold_features_check() -> dict:
 
     from dagster import AssetCheckResult
 
-    spark = get_spark_session("check_gold_features")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/features"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/features"
-        try:
-            df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold features data not found"},
-            )
-
-        row_count = df.count()
-        if row_count < 1:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold features data is empty", "row_count": row_count},
-            )
-
-        null_count = df.filter(F.col("clear_time_seconds").isNull()).count()
-        null_pct = null_count / row_count if row_count > 0 else 1.0
-
+        df = spark.read.parquet(path).filter(F.col("season") == settings.SEASON)
+    except Exception:
         return AssetCheckResult(
-            passed=(row_count >= 10 and null_count == 0),
-            metadata={
-                "row_count": row_count,
-                "null_clear_time_seconds": null_count,
-                "null_pct_clear_time_seconds": f"{null_pct:.4f}",
-            },
+            passed=False,
+            metadata={"error": "Gold features data not found"},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    if row_count < 1:
+        return AssetCheckResult(
+            passed=False,
+            metadata={"error": "Gold features data is empty", "row_count": row_count},
+        )
+
+    null_count = df.filter(F.col("clear_time_seconds").isNull()).count()
+    null_pct = null_count / row_count if row_count > 0 else 1.0
+
+    return AssetCheckResult(
+        passed=(row_count >= 10 and null_count == 0),
+        metadata={
+            "row_count": row_count,
+            "null_clear_time_seconds": null_count,
+            "null_pct_clear_time_seconds": f"{null_pct:.4f}",
+        },
+    )
 
 
 # ─── PR 1: per-asset row-count checks for previously untracked assets ──────
@@ -643,8 +602,9 @@ def gold_features_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "bronze_wcl"]),
     description="Bronze WCL: row_count >= 0 (graceful — WCL may be unavailable)",
+    required_resource_keys={"spark"},
 )
-def bronze_wcl_checks() -> dict:
+def bronze_wcl_checks(context) -> dict:
     """Check bronze_wcl data quality.
 
     Row-count check is intentionally graceful: WCL ingestion may return 0
@@ -654,159 +614,146 @@ def bronze_wcl_checks() -> dict:
     entirely (which would indicate a write problem, not an upstream
     outage).
     """
-    spark = get_spark_session("check_bronze_wcl")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/bronze/wcl"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/bronze/wcl"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Bronze WCL data not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 0,  # always true — graceful
-            metadata={"row_count": row_count, "graceful": True},
+            passed=False,
+            metadata={"error": "Bronze WCL data not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 0,  # always true — graceful
+        metadata={"row_count": row_count, "graceful": True},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "match_manifest"]),
     description="Match manifest: row_count >= 0 (graceful — may have 0 rows)",
+    required_resource_keys={"spark"},
 )
-def match_manifest_checks() -> dict:
+def match_manifest_checks(context) -> dict:
     """Check match_manifest data quality.
 
     Like ``bronze_wcl_checks``, the match manifest can be empty (no WCL
     reports matched) and the pipeline should still proceed.
     """
-    spark = get_spark_session("check_match_manifest")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/bronze/match_manifest"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/bronze/match_manifest"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Match manifest not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 0,  # always true — graceful
-            metadata={"row_count": row_count, "graceful": True},
+            passed=False,
+            metadata={"error": "Match manifest not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 0,  # always true — graceful
+        metadata={"row_count": row_count, "graceful": True},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_dim_dungeon"]),
     description="Gold dim_dungeon: row_count >= 1",
+    required_resource_keys={"spark"},
 )
-def gold_dim_dungeon_checks() -> dict:
+def gold_dim_dungeon_checks(context) -> dict:
     """Check gold_dim_dungeon data quality.
 
     Dimension tables must be non-empty; an empty dim breaks downstream
     joins (PR 2's RI check on dungeon_id would fail in that case).
     """
-    spark = get_spark_session("check_gold_dim_dungeon")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_dungeon"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_dungeon"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold dim_dungeon not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 1,
-            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_dungeon"},
+            passed=False,
+            metadata={"error": "Gold dim_dungeon not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 1,
+        metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_dungeon"},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_dim_player"]),
     description="Gold dim_player: row_count >= 1",
+    required_resource_keys={"spark"},
 )
-def gold_dim_player_checks() -> dict:
+def gold_dim_player_checks(context) -> dict:
     """Check gold_dim_player data quality."""
-    spark = get_spark_session("check_gold_dim_player")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_player"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_player"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold dim_player not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 1,
-            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_player"},
+            passed=False,
+            metadata={"error": "Gold dim_player not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 1,
+        metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_player"},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_dim_affix"]),
     description="Gold dim_affix: row_count >= 1",
+    required_resource_keys={"spark"},
 )
-def gold_dim_affix_checks() -> dict:
+def gold_dim_affix_checks(context) -> dict:
     """Check gold_dim_affix data quality."""
-    spark = get_spark_session("check_gold_dim_affix")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_affix"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_affix"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold dim_affix not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 1,
-            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_affix"},
+            passed=False,
+            metadata={"error": "Gold dim_affix not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 1,
+        metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_affix"},
+    )
 
 
 @asset_check(
     asset=AssetKey(["orakel", "gold_dim_spec"]),
     description="Gold dim_spec: row_count >= 1",
+    required_resource_keys={"spark"},
 )
-def gold_dim_spec_checks() -> dict:
+def gold_dim_spec_checks(context) -> dict:
     """Check gold_dim_spec data quality."""
-    spark = get_spark_session("check_gold_dim_spec")
+    spark = context.resources.spark
+    path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_spec"
     try:
-        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_spec"
-        try:
-            df = spark.read.parquet(path)
-        except Exception:
-            return AssetCheckResult(
-                passed=False,
-                metadata={"error": "Gold dim_spec not found", "row_count": 0},
-            )
-
-        row_count = df.count()
+        df = spark.read.parquet(path)
+    except Exception:
         return AssetCheckResult(
-            passed=row_count >= 1,
-            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_spec"},
+            passed=False,
+            metadata={"error": "Gold dim_spec not found", "row_count": 0},
         )
-    finally:
-        spark.stop()
+
+    row_count = df.count()
+    return AssetCheckResult(
+        passed=row_count >= 1,
+        metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_spec"},
+    )

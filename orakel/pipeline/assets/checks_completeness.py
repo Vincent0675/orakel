@@ -25,29 +25,29 @@ from dagster import AssetCheckResult, AssetKey, asset_check
 
 from orakel.config import settings
 from orakel.pipeline.assets.checks import check_completeness_ratio
-from orakel.utils.minio import get_spark_session
 
 logger = logging.getLogger(__name__)
 
 
 def _run_cr(
+    spark,
     upstream_path: str,
     downstream_path: str,
     min_ratio: float,
     season: str | None = None,
 ) -> AssetCheckResult:
-    """Acquire a SparkSession, run the completeness check, and tear down."""
-    spark = get_spark_session("cr_check")
-    try:
-        return check_completeness_ratio(
-            spark,
-            upstream_path=upstream_path,
-            downstream_path=downstream_path,
-            season=season or settings.SEASON,
-            min_ratio=min_ratio,
-        )
-    finally:
-        spark.stop()
+    """Run the completeness check using the caller-supplied SparkSession.
+
+    ``spark`` is provided by the Dagster ``spark_resource`` so this helper
+    no longer creates or tears down a session of its own.
+    """
+    return check_completeness_ratio(
+        spark,
+        upstream_path=upstream_path,
+        downstream_path=downstream_path,
+        season=season or settings.SEASON,
+        min_ratio=min_ratio,
+    )
 
 
 # ─── CR-1: bronze_rio -> silver_raiderio ─────────────────────────────────────
@@ -56,8 +56,9 @@ def _run_cr(
 @asset_check(
     asset=AssetKey(["orakel", "silver_raiderio"]),
     description="silver_raiderio row count >= 50% of bronze_rio",
+    required_resource_keys={"spark"},
 )
-def cr_bronze_to_silver_rio_check() -> dict:
+def cr_bronze_to_silver_rio_check(context) -> dict:
     """CR-1: bronze_rio -> silver_raiderio, min_ratio=0.5.
 
     Threshold is 50% because Silver applies dedup + null filtering;
@@ -68,6 +69,7 @@ def cr_bronze_to_silver_rio_check() -> dict:
             passed=True, metadata={"disabled": True, "min_ratio": 0.5}
         )
     return _run_cr(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs",
         min_ratio=0.5,
@@ -80,8 +82,9 @@ def cr_bronze_to_silver_rio_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_dungeon_runs"]),
     description="silver_dungeon_runs row count >= 30% of bronze_rio",
+    required_resource_keys={"spark"},
 )
-def cr_bronze_to_silver_dungeon_runs_check() -> dict:
+def cr_bronze_to_silver_dungeon_runs_check(context) -> dict:
     """CR-2: bronze_rio -> silver_dungeon_runs, min_ratio=0.3.
 
     Threshold is 30% because the fuzzy join between Raider.IO and WCL
@@ -92,6 +95,7 @@ def cr_bronze_to_silver_dungeon_runs_check() -> dict:
             passed=True, metadata={"disabled": True, "min_ratio": 0.3}
         )
     return _run_cr(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         min_ratio=0.3,
@@ -104,8 +108,9 @@ def cr_bronze_to_silver_dungeon_runs_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_player_performance"]),
     description="silver_player_performance row count >= 50% of bronze_wcl",
+    required_resource_keys={"spark"},
 )
-def cr_bronze_wcl_to_silver_player_perf_check() -> dict:
+def cr_bronze_wcl_to_silver_player_perf_check(context) -> dict:
     """CR-3: bronze_wcl -> silver_player_performance, min_ratio=0.5.
 
     Player performance is fan-out from WCL fights (5 players per fight),
@@ -117,6 +122,7 @@ def cr_bronze_wcl_to_silver_player_perf_check() -> dict:
             passed=True, metadata={"disabled": True, "min_ratio": 0.5}
         )
     return _run_cr(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/bronze/wcl",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/player_performance",
         min_ratio=0.5,
@@ -139,8 +145,9 @@ _GOLD_KPI_RIOS = {
 @asset_check(
     asset=AssetKey(["orakel", "gold_kpi_death_clock"]),
     description="Average gold KPI ratio against silver_raiderio >= 80% (composite)",
+    required_resource_keys={"spark"},
 )
-def cr_silver_rio_to_gold_kpis_composite_check() -> dict:
+def cr_silver_rio_to_gold_kpis_composite_check(context) -> dict:
     """CR-4: composite of silver_raiderio -> all 4 gold KPIs.
 
     Averages downstream/upstream ratio across all 4 gold KPIs to give
@@ -156,58 +163,55 @@ def cr_silver_rio_to_gold_kpis_composite_check() -> dict:
             passed=True, metadata={"disabled": True, "min_ratio": 0.8}
         )
 
-    spark = get_spark_session("cr_composite")
-    try:
-        upstream_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
-        season = settings.SEASON
-        ratios: list[float] = []
-        per_kpi: dict[str, float] = {}
-        upstream_count: int | None = None
+    spark = context.resources.spark
+    upstream_path = f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs"
+    season = settings.SEASON
+    ratios: list[float] = []
+    per_kpi: dict[str, float] = {}
+    upstream_count: int | None = None
 
-        for short, full_path in _GOLD_KPI_RIOS.items():
-            downstream_path = (
-                f"s3a://{settings.MINIO_BUCKET}/gold/{full_path}"
-            )
-            res = check_completeness_ratio(
-                spark,
-                upstream_path=upstream_path,
-                downstream_path=downstream_path,
-                season=season,
-                min_ratio=0.8,
-            )
-            # Each call returns AssetCheckResult — surface metadata
-            per_kpi[short] = float(res.metadata.get("ratio", 0.0))
-            if res.metadata.get("upstream_empty") is True:
-                # If upstream is empty, all KPIs report 0.0; bail early
-                return AssetCheckResult(
-                    passed=True,
-                    metadata={
-                        "composite_ratio": 0.0,
-                        "upstream_count": 0,
-                        "kpis": ",".join(_GOLD_KPI_RIOS.keys()),
-                        "upstream_empty": True,
-                        "min_ratio": 0.8,
-                    },
-                )
-            ratios.append(float(res.metadata.get("ratio", 0.0)))
-            if upstream_count is None:
-                upstream_count = int(res.metadata.get("upstream_count", 0))
-
-        composite = sum(ratios) / len(ratios) if ratios else 0.0
-        return AssetCheckResult(
-            passed=composite >= 0.8,
-            metadata={
-                "composite_ratio": round(composite, 4),
-                "min_ratio": 0.8,
-                "kpis": ",".join(per_kpi.keys()),
-                "per_kpi_ratio": ",".join(
-                    f"{k}={v:.2f}" for k, v in per_kpi.items()
-                ),
-                "upstream_count": upstream_count or 0,
-            },
+    for short, full_path in _GOLD_KPI_RIOS.items():
+        downstream_path = (
+            f"s3a://{settings.MINIO_BUCKET}/gold/{full_path}"
         )
-    finally:
-        spark.stop()
+        res = check_completeness_ratio(
+            spark,
+            upstream_path=upstream_path,
+            downstream_path=downstream_path,
+            season=season,
+            min_ratio=0.8,
+        )
+        # Each call returns AssetCheckResult — surface metadata
+        per_kpi[short] = float(res.metadata.get("ratio", 0.0))
+        if res.metadata.get("upstream_empty") is True:
+            # If upstream is empty, all KPIs report 0.0; bail early
+            return AssetCheckResult(
+                passed=True,
+                metadata={
+                    "composite_ratio": 0.0,
+                    "upstream_count": 0,
+                    "kpis": ",".join(_GOLD_KPI_RIOS.keys()),
+                    "upstream_empty": True,
+                    "min_ratio": 0.8,
+                },
+            )
+        ratios.append(float(res.metadata.get("ratio", 0.0)))
+        if upstream_count is None:
+            upstream_count = int(res.metadata.get("upstream_count", 0))
+
+    composite = sum(ratios) / len(ratios) if ratios else 0.0
+    return AssetCheckResult(
+        passed=composite >= 0.8,
+        metadata={
+            "composite_ratio": round(composite, 4),
+            "min_ratio": 0.8,
+            "kpis": ",".join(per_kpi.keys()),
+            "per_kpi_ratio": ",".join(
+                f"{k}={v:.2f}" for k, v in per_kpi.items()
+            ),
+            "upstream_count": upstream_count or 0,
+        },
+    )
 
 
 # ─── CR-5: silver_dungeon_runs -> gold_features ─────────────────────────────
@@ -216,8 +220,9 @@ def cr_silver_rio_to_gold_kpis_composite_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_features"]),
     description="gold_features row count >= 80% of silver_dungeon_runs",
+    required_resource_keys={"spark"},
 )
-def cr_silver_dungeon_runs_to_gold_features_check() -> dict:
+def cr_silver_dungeon_runs_to_gold_features_check(context) -> dict:
     """CR-5: silver_dungeon_runs -> gold_features, min_ratio=0.8.
 
     Feature view joins all KPIs + silver on run_id; expect to keep
@@ -228,6 +233,7 @@ def cr_silver_dungeon_runs_to_gold_features_check() -> dict:
             passed=True, metadata={"disabled": True, "min_ratio": 0.8}
         )
     return _run_cr(
+        context.resources.spark,
         upstream_path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         downstream_path=f"s3a://{settings.MINIO_BUCKET}/gold/features",
         min_ratio=0.8,
