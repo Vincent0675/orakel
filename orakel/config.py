@@ -55,5 +55,32 @@ class Settings:
         )
     )
 
+    # ─── AssetCheck tuning (SDD: Verification-Dagster-Orchestation) ─────────
+    # All checks are warning-only (non-blocking). These knobs tune the
+    # thresholds and let operators disable heavy checks during incidents.
+
+    # Completeness: downstream_count / upstream_count must be >= this.
+    # 0.5 = 50% — generous default, tune up after observing production.
+    CHECK_COMPLETENESS_THRESHOLD: float = field(
+        default_factory=lambda: float(os.getenv("CHECK_COMPLETENESS_THRESHOLD", "0.5"))
+    )
+
+    # Referential integrity sample size. 0 = full scan (default — Bronze/Silver
+    # are small). Increase to e.g. 10000 when Gold tables grow past 100k rows.
+    CHECK_RI_SAMPLE_SIZE: int = field(
+        default_factory=lambda: int(os.getenv("CHECK_RI_SAMPLE_SIZE", "0"))
+    )
+
+    # Master toggles — set to "false" in .env to disable an entire check class.
+    CHECK_RI_ENABLED: bool = field(
+        default_factory=lambda: os.getenv("CHECK_RI_ENABLED", "true").lower() == "true"
+    )
+    CHECK_COMPLETENESS_ENABLED: bool = field(
+        default_factory=lambda: os.getenv("CHECK_COMPLETENESS_ENABLED", "true").lower() == "true"
+    )
+    CHECK_SCHEMA_DRIFT_ENABLED: bool = field(
+        default_factory=lambda: os.getenv("CHECK_SCHEMA_DRIFT_ENABLED", "true").lower() == "true"
+    )
+
 
 settings = Settings()
