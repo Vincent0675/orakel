@@ -631,3 +631,182 @@ def gold_features_check() -> dict:
         )
     finally:
         spark.stop()
+
+
+# ─── PR 1: per-asset row-count checks for previously untracked assets ──────
+# These six assets had no @asset_check in the previous PR.  WCL and
+# match_manifest use row_count >= 0 (graceful — they may legitimately
+# produce 0 rows when the upstream API is unavailable).  Dimension tables
+# must have >= 1 row (they're lookups; an empty dim breaks joins).
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "bronze_wcl"]),
+    description="Bronze WCL: row_count >= 0 (graceful — WCL may be unavailable)",
+)
+def bronze_wcl_checks() -> dict:
+    """Check bronze_wcl data quality.
+
+    Row-count check is intentionally graceful: WCL ingestion may return 0
+    rows when the API is down or rate-limited (see ``bronze_wcl`` asset),
+    and we want to flag the empty state in the Dagster UI without failing
+    the whole pipeline.  The check still fails if the path is missing
+    entirely (which would indicate a write problem, not an upstream
+    outage).
+    """
+    spark = get_spark_session("check_bronze_wcl")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/bronze/wcl"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Bronze WCL data not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 0,  # always true — graceful
+            metadata={"row_count": row_count, "graceful": True},
+        )
+    finally:
+        spark.stop()
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "match_manifest"]),
+    description="Match manifest: row_count >= 0 (graceful — may have 0 rows)",
+)
+def match_manifest_checks() -> dict:
+    """Check match_manifest data quality.
+
+    Like ``bronze_wcl_checks``, the match manifest can be empty (no WCL
+    reports matched) and the pipeline should still proceed.
+    """
+    spark = get_spark_session("check_match_manifest")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/bronze/match_manifest"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Match manifest not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 0,  # always true — graceful
+            metadata={"row_count": row_count, "graceful": True},
+        )
+    finally:
+        spark.stop()
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "gold_dim_dungeon"]),
+    description="Gold dim_dungeon: row_count >= 1",
+)
+def gold_dim_dungeon_checks() -> dict:
+    """Check gold_dim_dungeon data quality.
+
+    Dimension tables must be non-empty; an empty dim breaks downstream
+    joins (PR 2's RI check on dungeon_id would fail in that case).
+    """
+    spark = get_spark_session("check_gold_dim_dungeon")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_dungeon"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Gold dim_dungeon not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 1,
+            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_dungeon"},
+        )
+    finally:
+        spark.stop()
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "gold_dim_player"]),
+    description="Gold dim_player: row_count >= 1",
+)
+def gold_dim_player_checks() -> dict:
+    """Check gold_dim_player data quality."""
+    spark = get_spark_session("check_gold_dim_player")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_player"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Gold dim_player not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 1,
+            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_player"},
+        )
+    finally:
+        spark.stop()
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "gold_dim_affix"]),
+    description="Gold dim_affix: row_count >= 1",
+)
+def gold_dim_affix_checks() -> dict:
+    """Check gold_dim_affix data quality."""
+    spark = get_spark_session("check_gold_dim_affix")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_affix"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Gold dim_affix not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 1,
+            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_affix"},
+        )
+    finally:
+        spark.stop()
+
+
+@asset_check(
+    asset=AssetKey(["orakel", "gold_dim_spec"]),
+    description="Gold dim_spec: row_count >= 1",
+)
+def gold_dim_spec_checks() -> dict:
+    """Check gold_dim_spec data quality."""
+    spark = get_spark_session("check_gold_dim_spec")
+    try:
+        path = f"s3a://{settings.MINIO_BUCKET}/gold/dim_spec"
+        try:
+            df = spark.read.parquet(path)
+        except Exception:
+            return AssetCheckResult(
+                passed=False,
+                metadata={"error": "Gold dim_spec not found", "row_count": 0},
+            )
+
+        row_count = df.count()
+        return AssetCheckResult(
+            passed=row_count >= 1,
+            metadata={"row_count": row_count, "error": "" if row_count >= 1 else "Empty dim_spec"},
+        )
+    finally:
+        spark.stop()
