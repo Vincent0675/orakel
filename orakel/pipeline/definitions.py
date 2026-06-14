@@ -12,9 +12,12 @@ from dagster import (
     Definitions,
     ScheduleDefinition,
     define_asset_job,
+    in_process_executor,
+    resource,
 )
 
 from orakel.config import settings
+from orakel.utils.minio import get_spark_session
 from orakel.pipeline.assets.bronze import (
     bronze_rio,
     bronze_wcl,
@@ -81,11 +84,35 @@ from orakel.pipeline.assets.silver import (
     silver_raiderio,
 )
 
+# ─── Resources ─────────────────────────────────────────────────────────────────
+
+
+@resource
+def spark_resource(_):
+    """Shared SparkSession for the lifetime of one pipeline run.
+
+    Yields a single ``SparkSession`` (created via ``get_spark_session``) so
+    that every asset and asset check consuming ``context.resources.spark``
+    operates on the same JVM session.  ``spark.stop()`` runs in
+    ``finally`` to guarantee teardown on success and failure paths.
+
+    Combined with ``in_process_executor`` on ``daily_pipeline_job`` this
+    eliminates the P0 4040-port collision caused by the previous
+    per-asset session creation under Dagster's multiprocess executor.
+    """
+    spark = get_spark_session("orakel_pipeline")
+    try:
+        yield spark
+    finally:
+        spark.stop()
+
+
 # ─── Jobs & Schedules ──────────────────────────────────────────────────────────
 
 daily_pipeline_job = define_asset_job(
     name="daily_pipeline",
     selection="*",
+    executor_def=in_process_executor,
     description="Full Orakel pipeline: Bronze → Silver → Gold",
 )
 
@@ -158,4 +185,5 @@ defs = Definitions(
         sd_gold_features_check,
     ],
     schedules=[daily_pipeline_schedule],
+    resources={"spark": spark_resource},
 )

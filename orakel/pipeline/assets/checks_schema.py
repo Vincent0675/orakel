@@ -44,29 +44,29 @@ from orakel.models.schemas import (
     silver_raiderio_schema,
 )
 from orakel.pipeline.assets.checks import check_schema_drift
-from orakel.utils.minio import get_spark_session
 
 logger = logging.getLogger(__name__)
 
 
 def _run_sd(
+    spark,
     path: str,
     expected_schema,
     mode: str = "superset",
     season: str | None = None,
 ) -> AssetCheckResult:
-    """Acquire a SparkSession, run the schema-drift check, tear down."""
-    spark = get_spark_session("sd_check")
-    try:
-        return check_schema_drift(
-            spark,
-            path=path,
-            expected_schema=expected_schema,
-            season=season or settings.SEASON,
-            mode=mode,
-        )
-    finally:
-        spark.stop()
+    """Run the schema-drift check using the caller-supplied SparkSession.
+
+    ``spark`` is provided by the Dagster ``spark_resource`` so this helper
+    no longer creates or tears down a session of its own.
+    """
+    return check_schema_drift(
+        spark,
+        path=path,
+        expected_schema=expected_schema,
+        season=season or settings.SEASON,
+        mode=mode,
+    )
 
 
 # ─── SD-1: bronze/raiderio/runs ──────────────────────────────────────────────
@@ -75,14 +75,16 @@ def _run_sd(
 @asset_check(
     asset=AssetKey(["orakel", "bronze_rio"]),
     description="bronze/raiderio/runs schema must contain bronze_raiderio_schema",
+    required_resource_keys={"spark"},
 )
-def sd_bronze_rio_check() -> dict:
+def sd_bronze_rio_check(context) -> dict:
     """SD-1: bronze_rio schema drift."""
     if not settings.CHECK_SCHEMA_DRIFT_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/bronze/raiderio/runs",
         expected_schema=bronze_raiderio_schema,
     )
@@ -94,8 +96,9 @@ def sd_bronze_rio_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "bronze_wcl"]),
     description="bronze/wcl schema must contain bronze_wcl_reports_schema",
+    required_resource_keys={"spark"},
 )
-def sd_bronze_wcl_check() -> dict:
+def sd_bronze_wcl_check(context) -> dict:
     """SD-2: bronze_wcl schema drift.
 
     Uses ``bronze_wcl_reports_schema`` (the primary WCL ingest target)
@@ -109,6 +112,7 @@ def sd_bronze_wcl_check() -> dict:
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/bronze/wcl",
         expected_schema=bronze_wcl_reports_schema,
     )
@@ -120,14 +124,16 @@ def sd_bronze_wcl_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_raiderio"]),
     description="silver/raiderio_runs schema must contain silver_raiderio_schema",
+    required_resource_keys={"spark"},
 )
-def sd_silver_raiderio_check() -> dict:
+def sd_silver_raiderio_check(context) -> dict:
     """SD-3: silver_raiderio schema drift."""
     if not settings.CHECK_SCHEMA_DRIFT_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/silver/raiderio_runs",
         expected_schema=silver_raiderio_schema,
     )
@@ -139,14 +145,16 @@ def sd_silver_raiderio_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_dungeon_runs"]),
     description="silver/dungeon_runs schema must contain silver_dungeon_runs_schema",
+    required_resource_keys={"spark"},
 )
-def sd_silver_dungeon_runs_check() -> dict:
+def sd_silver_dungeon_runs_check(context) -> dict:
     """SD-4: silver_dungeon_runs schema drift."""
     if not settings.CHECK_SCHEMA_DRIFT_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/silver/dungeon_runs",
         expected_schema=silver_dungeon_runs_schema,
     )
@@ -158,14 +166,16 @@ def sd_silver_dungeon_runs_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "silver_player_performance"]),
     description="silver/player_performance schema must contain silver_player_performance_schema",
+    required_resource_keys={"spark"},
 )
-def sd_silver_player_performance_check() -> dict:
+def sd_silver_player_performance_check(context) -> dict:
     """SD-5: silver_player_performance schema drift."""
     if not settings.CHECK_SCHEMA_DRIFT_ENABLED:
         return AssetCheckResult(
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/silver/player_performance",
         expected_schema=silver_player_performance_schema,
     )
@@ -192,8 +202,9 @@ _GOLD_KPI_SCHEMA_MAP = {
         "interrupt_rate, composition_synergy) must conform to "
         "their respective StructTypes (composite check)"
     ),
+    required_resource_keys={"spark"},
 )
-def sd_gold_kpis_composite_check() -> dict:
+def sd_gold_kpis_composite_check(context) -> dict:
     """SD-6: composite schema-drift check across all 4 gold KPIs.
 
     Attached to ``gold_kpi_death_clock`` as a representative target —
@@ -205,49 +216,46 @@ def sd_gold_kpis_composite_check() -> dict:
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
 
-    spark = get_spark_session("sd_kpis_composite")
-    try:
-        per_kpi_results: dict[str, bool] = {}
-        per_kpi_diffs: dict[str, str] = {}
-        any_path_missing = False
+    spark = context.resources.spark
+    per_kpi_results: dict[str, bool] = {}
+    per_kpi_diffs: dict[str, str] = {}
+    any_path_missing = False
 
-        for short, schema in _GOLD_KPI_SCHEMA_MAP.items():
-            path = f"s3a://{settings.MINIO_BUCKET}/gold/{short}"
-            res = check_schema_drift(
-                spark,
-                path=path,
-                expected_schema=schema,
-                season=settings.SEASON,
-                mode="superset",
-            )
-            per_kpi_results[short] = res.passed
-            if res.metadata.get("path_not_found") is True:
-                any_path_missing = True
-            diffs = []
-            if res.metadata.get("missing_columns"):
-                diffs.append(f"missing={res.metadata['missing_columns']}")
-            if res.metadata.get("type_mismatches"):
-                diffs.append(
-                    f"type_mismatch={res.metadata['type_mismatches']}"
-                )
-            per_kpi_diffs[short] = ",".join(diffs) if diffs else ""
-
-        composite_passed = all(per_kpi_results.values())
-        return AssetCheckResult(
-            passed=composite_passed,
-            metadata={
-                "kpis": ",".join(per_kpi_results.keys()),
-                "per_kpi_passed": ",".join(
-                    f"{k}={v}" for k, v in per_kpi_results.items()
-                ),
-                "per_kpi_diffs": ",".join(
-                    f"{k}={v}" for k, v in per_kpi_diffs.items() if v
-                ),
-                "path_not_found": any_path_missing,
-            },
+    for short, schema in _GOLD_KPI_SCHEMA_MAP.items():
+        path = f"s3a://{settings.MINIO_BUCKET}/gold/{short}"
+        res = check_schema_drift(
+            spark,
+            path=path,
+            expected_schema=schema,
+            season=settings.SEASON,
+            mode="superset",
         )
-    finally:
-        spark.stop()
+        per_kpi_results[short] = res.passed
+        if res.metadata.get("path_not_found") is True:
+            any_path_missing = True
+        diffs = []
+        if res.metadata.get("missing_columns"):
+            diffs.append(f"missing={res.metadata['missing_columns']}")
+        if res.metadata.get("type_mismatches"):
+            diffs.append(
+                f"type_mismatch={res.metadata['type_mismatches']}"
+            )
+        per_kpi_diffs[short] = ",".join(diffs) if diffs else ""
+
+    composite_passed = all(per_kpi_results.values())
+    return AssetCheckResult(
+        passed=composite_passed,
+        metadata={
+            "kpis": ",".join(per_kpi_results.keys()),
+            "per_kpi_passed": ",".join(
+                f"{k}={v}" for k, v in per_kpi_results.items()
+            ),
+            "per_kpi_diffs": ",".join(
+                f"{k}={v}" for k, v in per_kpi_diffs.items() if v
+            ),
+            "path_not_found": any_path_missing,
+        },
+    )
 
 
 # ─── SD-7: gold/features ─────────────────────────────────────────────────────
@@ -256,8 +264,9 @@ def sd_gold_kpis_composite_check() -> dict:
 @asset_check(
     asset=AssetKey(["orakel", "gold_features"]),
     description="gold/features schema must contain gold_features_schema",
+    required_resource_keys={"spark"},
 )
-def sd_gold_features_check() -> dict:
+def sd_gold_features_check(context) -> dict:
     """SD-7: gold_features schema drift.
 
     Uses ``gold_features_schema`` defined in ``orakel.models.schemas``.
@@ -270,6 +279,7 @@ def sd_gold_features_check() -> dict:
             passed=True, metadata={"disabled": True, "mode": "superset"}
         )
     return _run_sd(
+        context.resources.spark,
         path=f"s3a://{settings.MINIO_BUCKET}/gold/features",
         expected_schema=gold_features_schema,
     )
